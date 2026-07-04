@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/readme/banner.svg" alt="WaterDrop" width="880" />
+  <img src="docs/readme/banner.png" alt="WaterDrop" width="880" />
 </p>
 
 <p align="center">
