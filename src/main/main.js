@@ -105,6 +105,24 @@ async function startServer() {
   return dropServer;
 }
 
+// Publish `/drop` over Tailscale Serve so the QR code carries the real
+// phone-reachable HTTPS link (https://<name>.ts.net/drop/) instead of a raw
+// loopback/IP:port URL that a phone can't open. Best-effort and non-blocking:
+// if Tailscale is missing or serve isn't available, the app still works locally.
+async function autoPublishServe() {
+  try {
+    if (!dropServer) return;
+    const state = await tailscale.status();
+    if (!state.running || !state.loggedIn) return;
+    const current = await tailscale.inspect(dropServer.port);
+    if (current.servePathConfigured) return; // already published to this port
+    const result = await tailscale.configureServe(dropServer.port);
+    if (!result.ok) logDiagnostic("auto serve publish failed", result.message);
+  } catch (err) {
+    logDiagnostic("auto serve publish error", err);
+  }
+}
+
 async function createWindow() {
   const preload = path.join(__dirname, "preload.js");
   mainWindow = new BrowserWindow({
@@ -281,6 +299,7 @@ if (gotLock) {
       }
       Menu.setApplicationMenu(null);
       await startServer();
+      autoPublishServe(); // best-effort, non-blocking: makes the QR a real phone link
       applyLoginSettings();
       createTray();
       wireIpc();

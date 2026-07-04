@@ -1,5 +1,4 @@
 import {
-  Archive,
   ArrowUpCircle,
   Check,
   ChevronDown,
@@ -94,12 +93,12 @@ export default function App() {
     }
   }, [api, toast]);
 
-  const refreshInfo = useCallback(async () => {
+  const refreshInfo = useCallback(async ({ silent = false } = {}) => {
     try {
       const result = await api.getInfo();
       setInfo(result);
     } catch (err) {
-      toast(err.message || "Could not refresh network", "warn");
+      if (!silent) toast(err.message || "Could not refresh network", "warn");
     }
   }, [api, toast]);
 
@@ -137,14 +136,32 @@ export default function App() {
     const refreshQuietly = () => refreshFiles({ silent: true });
     const interval = window.setInterval(refreshQuietly, 3000);
     const onVisible = () => {
-      if (document.visibilityState === "visible") refreshQuietly();
+      if (document.visibilityState === "visible") {
+        refreshQuietly();
+        refreshInfo({ silent: true });
+      }
     };
     document.addEventListener("visibilitychange", onVisible);
     return () => {
       window.clearInterval(interval);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [busy, refreshFiles]);
+  }, [busy, refreshFiles, refreshInfo]);
+
+  // Tailscale Serve publishes a few seconds after launch. Poll the network only
+  // until the QR carries the real phone link (serve path published), then stop —
+  // no perpetual background spawning of the Tailscale CLI.
+  const servePublished = Boolean(info?.network?.servePathConfigured);
+  useEffect(() => {
+    if (busy || servePublished) return undefined;
+    let attempts = 0;
+    const timer = window.setInterval(() => {
+      attempts += 1;
+      refreshInfo({ silent: true });
+      if (attempts >= 12) window.clearInterval(timer); // give up after ~1 min
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [busy, servePublished, refreshInfo]);
 
   useEffect(() => {
     if (!isDesktop || !window.waterdrop?.update) return undefined;
@@ -186,15 +203,6 @@ export default function App() {
 
   const network = info?.network || appInfo?.network || {};
   const preferredUrl = network.preferredUrl || network.localUrl || appInfo?.server?.localUrl || "";
-  const isReady = Boolean(network.running && (network.servePathConfigured || network.tailnetIp));
-  const statusText = network.servePathConfigured
-    ? "Serve ready"
-    : network.running
-      ? "Tailnet direct"
-      : network.found
-        ? "Tailscale offline"
-        : "Local only";
-
   const stats = useMemo(() => {
     const totalBytes = files.reduce((sum, file) => sum + Number(file.size || 0), 0);
     return {
@@ -391,17 +399,6 @@ export default function App() {
       <div className="grain" aria-hidden="true" />
       <div className="shell">
         <aside className="conn">
-          <div className="brand">
-            <span className="brand-mark" aria-hidden="true">
-              <Archive size={24} strokeWidth={1.7} />
-            </span>
-            <span className="brand-name">Water Drop</span>
-            <span className="brand-tail mono small">
-              <span className={`dot ${isReady ? "dot-ok" : network.running ? "dot-idle" : "dot-warn"}`} />
-              <span className="muted">{statusText}</span>
-            </span>
-          </div>
-
           <div className="url-row">
             <div className="url-box mono" title={preferredUrl}>
               {preferredUrl || "Preparing..."}
