@@ -21,6 +21,7 @@ test("uploads, lists, previews, downloads, deletes, and clears files", async () 
   try {
     const base = server.localUrl;
     const expectedHash = sha256(Buffer.from("abcdef"));
+    const uploadId = "22222222-2222-4222-8222-222222222222";
 
     const upload = await fetch(new URL("api/files/raw", base), {
       method: "POST",
@@ -29,19 +30,37 @@ test("uploads, lists, previews, downloads, deletes, and clears files", async () 
         "Content-Type": "text/plain",
         "X-WaterDrop-File-Name": encodeURIComponent("sample.txt"),
         "X-WaterDrop-Mime-Type": "text/plain",
+        "X-WaterDrop-Upload-Id": uploadId,
       },
     });
     assert.equal(upload.status, 201);
     const uploadBody = await upload.json();
     assert.equal(uploadBody.files.length, 1);
+    assert.equal(uploadBody.files[0].id, uploadId);
     assert.equal(uploadBody.files[0].name, "sample.txt");
     assert.equal(uploadBody.files[0].size, 6);
     assert.equal(uploadBody.files[0].sha256, expectedHash);
+
+    const duplicateUpload = await fetch(new URL("api/files/raw", base), {
+      method: "POST",
+      body: new Blob(["abcdef-duplicate"], { type: "text/plain" }),
+      headers: {
+        "Content-Type": "text/plain",
+        "X-WaterDrop-File-Name": encodeURIComponent("sample.txt"),
+        "X-WaterDrop-Mime-Type": "text/plain",
+        "X-WaterDrop-Upload-Id": uploadId,
+      },
+    });
+    assert.equal(duplicateUpload.status, 200);
+    const duplicateUploadBody = await duplicateUpload.json();
+    assert.equal(duplicateUploadBody.duplicate, true);
+    assert.equal(duplicateUploadBody.files[0].id, uploadId);
 
     const listed = await fetch(new URL("api/files", base));
     assert.equal(listed.status, 200);
     const listedBody = await listed.json();
     assert.equal(listedBody.files.length, 1);
+    assert.equal(listedBody.files[0].size, 6);
 
     const strippedListed = await fetch(`http://127.0.0.1:${server.port}/api/files`);
     assert.equal(strippedListed.status, 200);

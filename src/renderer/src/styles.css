@@ -601,6 +601,9 @@ body::before {
 .upload-status.err {
   color: var(--danger);
 }
+.upload-status.queued {
+  color: var(--faint);
+}
 .upload-tail {
   display: flex;
   align-items: center;
@@ -625,6 +628,11 @@ body::before {
 }
 .upload-bar-fill[data-status="error"] {
   background: var(--danger);
+}
+.upload-bar-fill[data-status="queued"],
+.upload-bar-fill[data-status="syncing"] {
+  background: var(--silver);
+  opacity: 0.55;
 }
 
 /* ---- Shelf / file cards ---- */

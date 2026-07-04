@@ -1,0 +1,17 @@
+{
+  "name": "WaterDrop",
+  "short_name": "WaterDrop",
+  "description": "Private file shelf for trusted Tailscale devices.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#08080a",
+  "theme_color": "#08080a",
+  "icons": [
+    {
+      "src": "./icon.ico",
+      "sizes": "16x16 24x24 32x32 48x48 64x64 128x128 256x256",
+      "type": "image/x-icon"
+    }
+  ]
+}

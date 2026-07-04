@@ -1,6 +1,6 @@
 {
   "name": "waterdrop",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Private AirDrop-style file shelf for Tailscale networks.",
   "main": "src/main/main.js",
   "scripts": {

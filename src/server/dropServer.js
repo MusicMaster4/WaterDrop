@@ -95,6 +95,7 @@ class FileStore extends EventEmitter {
   }
 
   addPendingUpload({ id, name, size }) {
+    this.clearPendingUpload(id);
     const entry = {
       id,
       name: safeDisplayName(name),
@@ -459,8 +460,16 @@ async function handleApi({ req, res, relative, store, getPort, eventClients }) {
 async function handleRawUpload(req, res, store) {
   const originalName = decodeHeaderValue(req.headers["x-waterdrop-file-name"]) || "unnamed-file";
   const mimeType = cleanHeaderValue(req.headers["x-waterdrop-mime-type"]) || cleanMimeType(req.headers["content-type"]);
-  const id = crypto.randomUUID();
-  const tempPath = path.join(store.tmpDir, `${id}.upload`);
+  const requestedId = cleanHeaderValue(req.headers["x-waterdrop-upload-id"]);
+  const id = isValidFileId(requestedId) ? requestedId : crypto.randomUUID();
+  const existingFile = store.get(id);
+  if (existingFile) {
+    req.resume();
+    sendJson(res, 200, { files: [toPublicFile(existingFile)], duplicate: true });
+    return;
+  }
+
+  const tempPath = path.join(store.tmpDir, `${id}.${crypto.randomUUID()}.upload`);
   const hash = crypto.createHash("sha256");
   let size = 0;
 
@@ -482,6 +491,12 @@ async function handleRawUpload(req, res, store) {
       meter,
       fs.createWriteStream(tempPath, { highWaterMark: UPLOAD_HIGH_WATER_MARK })
     );
+    const finishedElsewhere = store.get(id);
+    if (finishedElsewhere) {
+      await removeIfExists(tempPath);
+      sendJson(res, 200, { files: [toPublicFile(finishedElsewhere)], duplicate: true });
+      return;
+    }
     const file = await store.addFromTemp({
       id,
       tempPath,
@@ -734,9 +749,10 @@ async function serveStatic({ req, res, pathname, rendererDir }) {
     return;
   }
 
+  const noStoreAsset = /(?:^|[\\/])(?:index\.html|waterdrop-sw\.js|manifest\.webmanifest)$/.test(filePath);
   res.writeHead(200, {
     ...corsHeaders(),
-    "Cache-Control": filePath.endsWith("index.html") ? "no-store" : "public, max-age=31536000, immutable",
+    "Cache-Control": noStoreAsset ? "no-store" : "public, max-age=31536000, immutable",
     "Content-Length": stat.size,
     "Content-Type": mime.lookup(filePath) || "application/octet-stream",
   });
@@ -848,6 +864,10 @@ function isTailscaleIpv4(ip) {
   return parts.length === 4 && parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127;
 }
 
+function isValidFileId(id) {
+  return typeof id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+}
+
 function toPublicFile(file) {
   return {
     id: file.id,
@@ -876,7 +896,7 @@ function sendJson(res, status, payload) {
 
 function corsHeaders() {
   return {
-    "Access-Control-Allow-Headers": "Content-Type, Range, X-WaterDrop-File-Name, X-WaterDrop-Mime-Type",
+    "Access-Control-Allow-Headers": "Content-Type, Range, X-WaterDrop-File-Name, X-WaterDrop-Mime-Type, X-WaterDrop-Upload-Id",
     "Access-Control-Allow-Methods": "GET, HEAD, POST, DELETE, OPTIONS",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Expose-Headers": "Accept-Ranges, Content-Disposition, Content-Length, Content-Range, ETag, Last-Modified, X-WaterDrop-SHA256",

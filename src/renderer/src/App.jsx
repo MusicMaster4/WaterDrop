@@ -32,6 +32,21 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import logoUrl from "./logo.png";
+import {
+  PAGE_UPLOAD_LOCK_MS,
+  claimQueuedUpload,
+  clearQueuedUpload,
+  isUploadQueueSupported,
+  listQueuedUploads,
+  markQueuedUploadFailed,
+  markQueuedUploadSyncing,
+  queueUpload,
+  requestBackgroundFetchUpload,
+  requestBackgroundUploadSync,
+  touchQueuedUploadLock,
+  updateQueuedUploadProgress,
+  uploadRecordToView,
+} from "./uploadQueue";
 
 const TAILSCALE_URL = "https://tailscale.com/download";
 const TAILSCALE_IOS_URL = "https://apps.apple.com/app/tailscale/id1470499037";
@@ -76,6 +91,8 @@ export default function App() {
   const fileInputRef = useRef(null);
   const dragDepth = useRef(0);
   const noticeTimeoutRef = useRef(null);
+  const serviceWorkerRegistrationRef = useRef(null);
+  const drainingUploadsRef = useRef(false);
   const [api, setApi] = useState(apiDefault);
   const [appInfo, setAppInfo] = useState(null);
   const [info, setInfo] = useState(null);
@@ -92,6 +109,12 @@ export default function App() {
   const [previewFile, setPreviewFile] = useState(null);
   const [update, setUpdate] = useState(null);
   const [showOnboarding, setShowOnboarding] = useState(false);
+  const [uploadSupport, setUploadSupport] = useState({
+    queue: isUploadQueueSupported(),
+    serviceWorker: false,
+    backgroundFetch: false,
+    backgroundSync: false,
+  });
 
   const notify = useCallback((message, kind = "info", action) => {
     if (!message) return;
@@ -127,6 +150,129 @@ export default function App() {
     }
   }, [api, notify]);
 
+  const refreshQueuedUploads = useCallback(async () => {
+    if (!isUploadQueueSupported()) return;
+    try {
+      const records = await listQueuedUploads();
+      setUploads((items) => {
+        const transient = items.filter((item) => !item.queued);
+        return [...records.map(uploadRecordToView), ...transient].sort(sortUploads);
+      });
+    } catch (err) {
+      notify(err.message || "Could not read upload queue", "warn");
+    }
+  }, [notify]);
+
+  const registerBackgroundUpload = useCallback(async () => {
+    const registration = serviceWorkerRegistrationRef.current;
+    if (!registration) return false;
+    try {
+      return await requestBackgroundUploadSync(registration);
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const startBackgroundFetchUpload = useCallback(async (record) => {
+    const registration = serviceWorkerRegistrationRef.current;
+    if (!registration?.backgroundFetch?.fetch) return false;
+    try {
+      const syncing = await markQueuedUploadSyncing(record.id);
+      const bgFetch = await requestBackgroundFetchUpload(registration, syncing || record);
+      if (!bgFetch) return false;
+      setUploads((items) =>
+        upsertUpload(items, { ...uploadRecordToView(syncing || record), status: "syncing", progress: 1 })
+      );
+      bgFetch.addEventListener?.("progress", () => {
+        const total = Number(bgFetch.uploadTotal || 0);
+        if (!total) return;
+        const progress = Math.max(1, Math.min(99, Math.round((bgFetch.uploaded / total) * 100)));
+        setUploads((items) =>
+          upsertUpload(items, { ...uploadRecordToView(syncing || record), status: "syncing", progress })
+        );
+      });
+      return true;
+    } catch {
+      await markQueuedUploadFailed(record.id, "Background fetch unavailable").catch(() => {});
+      return false;
+    }
+  }, []);
+
+  const drainQueuedUploads = useCallback(async () => {
+    if (drainingUploadsRef.current || !api.rawUploadUrl || !isUploadQueueSupported()) return;
+    drainingUploadsRef.current = true;
+    try {
+      const records = await listQueuedUploads();
+      for (const record of records) {
+        const activeBackgroundFetch = await serviceWorkerRegistrationRef.current?.backgroundFetch
+          ?.get(record.id)
+          .catch(() => null);
+        if (activeBackgroundFetch) continue;
+        const claimed = await claimQueuedUpload(record.id);
+        if (!claimed) continue;
+        await uploadQueuedRecord({
+          api,
+          record: claimed,
+          notify,
+          refreshFiles,
+          registerBackgroundUpload,
+          setUploads,
+        });
+      }
+    } finally {
+      drainingUploadsRef.current = false;
+      await refreshQueuedUploads();
+    }
+  }, [api, notify, refreshFiles, refreshQueuedUploads, registerBackgroundUpload]);
+
+  useEffect(() => {
+    if (!("serviceWorker" in navigator) || !window.isSecureContext) {
+      setUploadSupport({
+        queue: isUploadQueueSupported(),
+        serviceWorker: false,
+        backgroundFetch: false,
+        backgroundSync: false,
+      });
+      return undefined;
+    }
+
+    let active = true;
+    const swUrl = new URL("waterdrop-sw.js", window.location.href);
+    const scope = new URL("./", window.location.href).pathname;
+    navigator.serviceWorker.register(swUrl, { scope }).then(async (registration) => {
+      const readyRegistration = await navigator.serviceWorker.ready;
+      if (!active) return;
+      serviceWorkerRegistrationRef.current = readyRegistration || registration;
+      setUploadSupport({
+        queue: isUploadQueueSupported(),
+        serviceWorker: true,
+        backgroundFetch: Boolean((readyRegistration || registration).backgroundFetch?.fetch),
+        backgroundSync: Boolean((readyRegistration || registration).sync?.register),
+      });
+      registerBackgroundUpload();
+    }).catch(() => {
+      if (!active) return;
+      setUploadSupport({
+        queue: isUploadQueueSupported(),
+        serviceWorker: false,
+        backgroundFetch: false,
+        backgroundSync: false,
+      });
+    });
+
+    const onMessage = (event) => {
+      const type = event.data?.type || "";
+      if (!type.startsWith("WATERDROP_UPLOAD_")) return;
+      refreshQueuedUploads();
+      refreshFiles({ silent: true });
+    };
+    navigator.serviceWorker.addEventListener("message", onMessage);
+    return () => {
+      active = false;
+      navigator.serviceWorker.removeEventListener("message", onMessage);
+    };
+  }, [refreshFiles, refreshQueuedUploads, registerBackgroundUpload]);
+
   useEffect(() => {
     let mounted = true;
     async function boot() {
@@ -155,7 +301,8 @@ export default function App() {
     if (busy) return;
     refreshInfo();
     refreshFiles();
-  }, [busy, refreshFiles, refreshInfo]);
+    refreshQueuedUploads().then(drainQueuedUploads);
+  }, [busy, drainQueuedUploads, refreshFiles, refreshInfo, refreshQueuedUploads]);
 
   useEffect(() => {
     if (busy) return undefined;
@@ -170,15 +317,24 @@ export default function App() {
       if (document.visibilityState === "visible") {
         refreshQuietly();
         refreshInfo({ silent: true });
+        refreshQueuedUploads().then(drainQueuedUploads);
       }
     };
+    const onOnline = () => {
+      registerBackgroundUpload();
+      refreshQueuedUploads().then(drainQueuedUploads);
+    };
+    window.addEventListener("online", onOnline);
+    window.addEventListener("focus", onOnline);
     document.addEventListener("visibilitychange", onVisible);
     return () => {
       window.clearInterval(interval);
       events?.close();
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("focus", onOnline);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [api, busy, refreshFiles, refreshInfo]);
+  }, [api, busy, drainQueuedUploads, refreshFiles, refreshInfo, refreshQueuedUploads, registerBackgroundUpload]);
 
   // Tailscale Serve publishes a few seconds after launch. Poll the network only
   // until the QR carries the real phone link (serve path published), then stop —
@@ -238,6 +394,13 @@ export default function App() {
       nextExpiry: files.reduce((min, file) => Math.min(min, file.expiresAt || Infinity), Infinity),
     };
   }, [files]);
+  const uploadModeTitle = uploadSupport.backgroundFetch
+    ? "Background uploads can continue through the browser task UI."
+    : uploadSupport.backgroundSync
+    ? "Queued uploads can retry in the background on this browser."
+    : uploadSupport.queue
+      ? "Queued uploads resume when this page is open."
+      : "Standard upload: keep this page open.";
 
   // Placeholders for uploads still in flight anywhere on the tailnet. Drop any
   // whose real file has already landed so the swap has no flicker or duplicate.
@@ -348,14 +511,46 @@ export default function App() {
   async function uploadFiles(picked) {
     const valid = picked.filter(Boolean);
     if (!valid.length) return;
-    valid.forEach((file) => uploadOne(file));
+    if (!api.rawUploadUrl || !isUploadQueueSupported()) {
+      valid.forEach((file) => uploadOneLegacy(file));
+      return;
+    }
+
+    let queued = 0;
+    let browserBackground = 0;
+    for (const file of valid) {
+      try {
+        const record = await queueUpload(file, api.rawUploadUrl);
+        queued += 1;
+        setUploads((items) => upsertUpload(items, uploadRecordToView(record)));
+        if (await startBackgroundFetchUpload(record)) {
+          browserBackground += 1;
+        }
+      } catch (err) {
+        notify(err.message || `Could not queue ${file.name}`, "warn");
+        uploadOneLegacy(file);
+      }
+    }
+
+    if (queued > 0) {
+      const hasBackgroundSync = await registerBackgroundUpload();
+      notify(
+        browserBackground > 0
+          ? "Upload handed to the browser background task."
+          : hasBackgroundSync
+          ? "Upload queued for background retry."
+          : "Upload queued. It resumes when this page is open.",
+        browserBackground > 0 || hasBackgroundSync ? "ok" : "info"
+      );
+      if (browserBackground < queued) drainQueuedUploads();
+    }
   }
 
-  function uploadOne(file) {
+  function uploadOneLegacy(file) {
     const id = crypto.randomUUID();
     setUploads((items) => [
       ...items,
-      { id, name: file.name, size: file.size, progress: 0, status: "uploading" },
+      { id, name: file.name, size: file.size, progress: 0, status: "uploading", createdAt: Date.now() },
     ]);
 
     const xhr = new XMLHttpRequest();
@@ -365,6 +560,7 @@ export default function App() {
       xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
       xhr.setRequestHeader("X-WaterDrop-File-Name", encodeURIComponent(file.name || "unnamed-file"));
       xhr.setRequestHeader("X-WaterDrop-Mime-Type", file.type || "application/octet-stream");
+      xhr.setRequestHeader("X-WaterDrop-Upload-Id", id);
     }
     xhr.upload.onprogress = (event) => {
       if (!event.lengthComputable) return;
@@ -561,7 +757,7 @@ export default function App() {
               </label>
               <div className="update-row">
                 <span className="mono small muted">
-                  v{update?.currentVersion || appInfo?.version || "?"}
+                  v{formatAppVersion(update?.currentVersion || appInfo?.version || "?")}
                 </span>
                 <button className="btn btn-ghost btn-xs" onClick={checkForUpdate}>
                   <RefreshCw size={13} /> Check updates
@@ -616,7 +812,7 @@ export default function App() {
                   </button>
                 )
               )}
-              <button className="btn btn-solid btn-sm" onClick={pickFiles}>
+              <button className="btn btn-solid btn-sm" title={uploadModeTitle} onClick={pickFiles}>
                 <UploadCloud size={15} /> Upload
               </button>
             </div>
@@ -653,6 +849,7 @@ export default function App() {
             onDragOver={(event) => event.preventDefault()}
             onDragEnter={onDragEnter}
             onDragLeave={onDragLeave}
+            title={uploadModeTitle}
           >
             <UploadCloud className="dz-icon" size={34} strokeWidth={1.5} />
             <span className="dz-title">Drop files</span>
@@ -666,8 +863,8 @@ export default function App() {
                 <div className="upload-row" key={upload.id}>
                   <div className="upload-top">
                     <span className="upload-name">{upload.name}</span>
-                    <span className={`upload-status mono small ${upload.status === "done" ? "ok" : upload.status === "error" ? "err" : ""}`}>
-                      {upload.status === "done" ? "done" : upload.status === "error" ? "error" : `${upload.progress}%`}
+                    <span className={`upload-status mono small ${upload.status === "done" ? "ok" : upload.status === "error" ? "err" : upload.status === "queued" ? "queued" : ""}`}>
+                      {uploadStatusText(upload)}
                     </span>
                   </div>
                   <div className="upload-tail">
@@ -990,7 +1187,7 @@ function UpdateInline({ update, onDownload, onInstall }) {
       {state === "error" && <span className="mono small danger">{update.message || "Update check failed."}</span>}
       {state === "available" && (
         <>
-          <span className="mono small muted">Version {update.version} is available.</span>
+          <span className="mono small muted">Version {formatAppVersion(update.version)} is available.</span>
           <button className="btn btn-solid btn-xs" onClick={onDownload}>
             <Download size={13} /> Download &amp; Update
           </button>
@@ -1006,7 +1203,7 @@ function UpdateInline({ update, onDownload, onInstall }) {
       )}
       {state === "downloaded" && (
         <>
-          <span className="mono small muted">Version {update.version || ""} is ready.</span>
+          <span className="mono small muted">Version {formatAppVersion(update.version || "")} is ready.</span>
           <button className="btn btn-solid btn-xs" onClick={onInstall}>
             <RefreshCw size={13} /> Install &amp; Restart
           </button>
@@ -1373,6 +1570,86 @@ async function request(url, options = {}) {
   return body;
 }
 
+async function uploadQueuedRecord({
+  api,
+  record,
+  notify,
+  refreshFiles,
+  registerBackgroundUpload,
+  setUploads,
+}) {
+  const uploadUrl = record.uploadUrl || api.rawUploadUrl;
+  const view = uploadRecordToView(record);
+  setUploads((items) => upsertUpload(items, { ...view, status: "uploading", progress: 0 }));
+
+  let lastPersistedProgress = 0;
+  const lockTimer = window.setInterval(() => {
+    touchQueuedUploadLock(record.id).catch(() => {});
+  }, Math.max(5000, Math.floor(PAGE_UPLOAD_LOCK_MS / 3)));
+
+  try {
+    await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", uploadUrl, true);
+      xhr.setRequestHeader("Content-Type", record.mimeType || "application/octet-stream");
+      xhr.setRequestHeader("X-WaterDrop-File-Name", encodeURIComponent(record.name || "unnamed-file"));
+      xhr.setRequestHeader("X-WaterDrop-Mime-Type", record.mimeType || "application/octet-stream");
+      xhr.setRequestHeader("X-WaterDrop-Upload-Id", record.id);
+      xhr.upload.onprogress = (event) => {
+        if (!event.lengthComputable) return;
+        const progress = Math.round((event.loaded / event.total) * 100);
+        setUploads((items) => upsertUpload(items, { ...view, status: "uploading", progress }));
+        if (progress - lastPersistedProgress >= 10 || progress === 100) {
+          lastPersistedProgress = progress;
+          updateQueuedUploadProgress(record.id, progress).catch(() => {});
+        }
+      };
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve();
+          return;
+        }
+        reject(new Error(`HTTP ${xhr.status}`));
+      };
+      xhr.onerror = () => reject(new Error("Network error"));
+      xhr.onabort = () => reject(new Error("Upload aborted"));
+      xhr.send(record.blob);
+    });
+
+    await clearQueuedUpload(record.id);
+    setUploads((items) => upsertUpload(items, { ...view, queued: false, status: "done", progress: 100 }));
+    window.setTimeout(() => {
+      setUploads((items) => items.filter((item) => item.id !== record.id));
+    }, 1400);
+    await refreshFiles();
+  } catch (err) {
+    const queued = await markQueuedUploadFailed(record.id, err.message || "Upload paused");
+    if (queued) setUploads((items) => upsertUpload(items, uploadRecordToView(queued)));
+    await registerBackgroundUpload();
+    notify("Upload paused. It will retry when possible.", "warn");
+  } finally {
+    window.clearInterval(lockTimer);
+  }
+}
+
+function upsertUpload(items, upload) {
+  const next = items.filter((item) => item.id !== upload.id);
+  next.push(upload);
+  return next.sort(sortUploads);
+}
+
+function sortUploads(a, b) {
+  return Number(a.createdAt || 0) - Number(b.createdAt || 0);
+}
+
+function uploadStatusText(upload) {
+  if (upload.status === "done") return "done";
+  if (upload.status === "error") return "error";
+  if (upload.status === "queued") return "queued";
+  if (upload.status === "syncing") return "syncing";
+  return `${upload.progress || 0}%`;
+}
+
 function isWaterDropDrag(event) {
   return Array.from(event.dataTransfer?.types || []).includes("application/x-waterdrop-file");
 }
@@ -1454,4 +1731,11 @@ function timeLeft(timestamp) {
 function shortHash(hash) {
   if (!hash) return "no hash";
   return `${hash.slice(0, 10)}...${hash.slice(-6)}`;
+}
+
+function formatAppVersion(version) {
+  const raw = String(version || "");
+  const match = raw.match(/^(\d+)\.(\d+)\.(\d+)$/);
+  if (!match) return raw;
+  return `${Number(match[1])}.${Number(match[2])}.${String(Number(match[3])).padStart(2, "0")}`;
 }
