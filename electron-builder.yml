@@ -1,0 +1,18 @@
+appId: dev.jubarte.waterdrop
+productName: Water Drop
+directories:
+  output: release
+files:
+  - src/**/*
+  - dist/renderer/**/*
+  - package.json
+extraMetadata:
+  main: src/main/main.js
+win:
+  target:
+    - nsis
+  icon: assets/icon.ico
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true

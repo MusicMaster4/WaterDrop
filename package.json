@@ -1,0 +1,40 @@
+{
+  "name": "water-drop",
+  "version": "0.1.0",
+  "description": "Private AirDrop-style file shelf for Tailscale networks.",
+  "main": "src/main/main.js",
+  "scripts": {
+    "dev": "npm run make:icon && concurrently -k \"npm:dev:renderer\" \"npm:dev:electron\"",
+    "dev:renderer": "vite --host 127.0.0.1",
+    "dev:electron": "wait-on http://127.0.0.1:5173 && cross-env WATERDROP_RENDERER_URL=http://127.0.0.1:5173 electron .",
+    "start": "npm run make:icon && npm run build:renderer && electron .",
+    "build": "npm run make:icon && npm run build:renderer",
+    "build:renderer": "vite build",
+    "make:icon": "node scripts/make-icon.js",
+    "dist": "npm run make:icon && npm run build && electron-builder",
+    "test": "node --test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "busboy": "^1.6.0",
+    "lucide-react": "^1.23.0",
+    "mime-types": "^3.0.2",
+    "qrcode": "^1.5.4",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.0.3",
+    "concurrently": "^10.0.3",
+    "cross-env": "^10.1.0",
+    "electron": "^43.0.0",
+    "electron-builder": "^26.15.3",
+    "png-to-ico": "^3.0.1",
+    "sharp": "^0.35.3",
+    "vite": "^8.1.3",
+    "wait-on": "^9.0.10"
+  }
+}
