@@ -1087,3 +1087,366 @@ body::before {
   background: var(--ink);
   transition: width 200ms var(--ease);
 }
+
+.full-btn {
+  width: 100%;
+  margin-top: 10px;
+}
+
+/* ============================================================
+   ONBOARDING -- first-run setup guide
+   Left rail with vertical progress, right pane with one step at a
+   time. Same "Chapa Noir" surface as the rest of the app.
+   ============================================================ */
+.onboarding {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: grid;
+  grid-template-columns: 1fr;
+  background: var(--bg);
+  animation: viewIn 320ms var(--ease) both;
+  overflow: auto;
+}
+
+.onb-rail {
+  display: none;
+}
+
+.onb-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.onb-brand-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  border: 1px solid var(--line-strong);
+  background: var(--panel);
+  color: var(--ink);
+}
+.onb-brand-name {
+  font-family: var(--display);
+  font-weight: 900;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--ink);
+  font-size: 1rem;
+}
+
+.onb-steps {
+  list-style: none;
+  margin: 40px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+.onb-step {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.onb-dot {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border-radius: 50%;
+  border: 1px solid var(--line-strong);
+  background: var(--panel-solid);
+  color: var(--muted);
+  font: 700 0.72rem var(--mono);
+  transition: all 0.2s var(--ease);
+}
+.onb-dot.is-active {
+  border-color: var(--ink);
+  color: var(--ink);
+  box-shadow: 0 0 0 4px rgba(247, 248, 250, 0.06);
+}
+.onb-dot.is-done {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: #08080a;
+}
+.onb-label {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.85rem;
+  letter-spacing: 0.02em;
+  transition: color 0.2s var(--ease);
+}
+.onb-label.is-active {
+  color: var(--ink);
+}
+.onb-foot {
+  margin-top: auto;
+}
+
+.onb-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  padding: 28px 22px calc(22px + env(safe-area-inset-bottom));
+  max-width: 760px;
+  margin: 0 auto;
+  width: 100%;
+}
+.onb-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 0;
+}
+
+.onb-view {
+  display: flex;
+  flex-direction: column;
+}
+.onb-anim-fwd {
+  animation: onbInFwd 360ms var(--ease) both;
+}
+.onb-anim-back {
+  animation: onbInBack 360ms var(--ease) both;
+}
+@keyframes onbInFwd {
+  from { opacity: 0; transform: translateX(26px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes onbInBack {
+  from { opacity: 0; transform: translateX(-26px); }
+  to { opacity: 1; transform: none; }
+}
+
+.onb-title {
+  font-family: var(--display);
+  font-weight: 900;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  font-size: clamp(1.7rem, 4.4vw, 2.5rem);
+  line-height: 1.05;
+  margin: 0 0 14px;
+}
+.onb-lead {
+  color: var(--text);
+  font-size: 1.02rem;
+  line-height: 1.55;
+  max-width: 52ch;
+  margin: 0 0 22px;
+}
+.onb-lead b {
+  color: var(--ink);
+}
+
+/* Welcome */
+.onb-welcome {
+  position: relative;
+  isolation: isolate;
+}
+.onb-iris {
+  position: absolute;
+  z-index: -1;
+  top: -60px;
+  left: -40px;
+  width: 320px;
+  height: 320px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(143, 184, 154, 0.16), transparent 62%);
+  filter: blur(6px);
+  pointer-events: none;
+}
+.onb-hero-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 84px;
+  height: 84px;
+  border-radius: 20px;
+  border: 1px solid var(--line-strong);
+  background: var(--panel);
+  color: var(--ink);
+  margin-bottom: 20px;
+}
+.onb-hero-mark-sm {
+  width: 72px;
+  height: 72px;
+  color: var(--ok);
+}
+.onb-chips {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+}
+.onb-chips li {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  border-radius: 99px;
+  padding: 7px 13px;
+  color: var(--silver);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+/* Cards + status inside steps */
+.onb-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  padding: 12px;
+  margin-bottom: 16px;
+}
+.onb-card .status-line {
+  border: none;
+  background: none;
+  padding: 0;
+  animation: none;
+}
+.onb-url {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--panel-strong);
+  border: 1px solid var(--line);
+  color: var(--silver);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.onb-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+}
+.onb-note {
+  margin: 14px 0 0;
+}
+
+/* Phone step */
+.onb-phone-steps {
+  display: grid;
+  gap: 12px;
+}
+.onb-phone-step {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  padding: 16px;
+  position: relative;
+}
+.onb-phone-num {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--ink);
+  color: #08080a;
+  font: 800 0.78rem var(--mono);
+  margin-bottom: 10px;
+}
+.onb-phone-title {
+  margin: 0 0 4px;
+  color: var(--ink);
+  font-size: 0.98rem;
+}
+.onb-phone-desc {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+.onb-phone-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+.onb-link {
+  background: var(--panel-strong);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  color: var(--text);
+  font: 600 0.74rem var(--sans);
+  letter-spacing: 0.03em;
+  padding: 7px 11px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+.onb-link:hover {
+  color: var(--ink);
+  border-color: var(--ink);
+  background: var(--panel);
+}
+
+/* Finish segmented choice */
+.onb-segmented {
+  display: inline-flex;
+  gap: 6px;
+  padding: 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: var(--panel-solid);
+  flex-wrap: wrap;
+}
+.onb-seg {
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font: 600 0.82rem var(--sans);
+  letter-spacing: 0.02em;
+  padding: 10px 16px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.onb-seg.is-selected {
+  background: var(--ink);
+  color: #08080a;
+  border-color: var(--ink);
+}
+
+/* Nav row */
+.onb-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 22px;
+  border-top: 1px solid var(--line);
+  margin-top: 22px;
+}
+.onb-nav .btn:only-child {
+  margin-left: auto;
+}
+.onb-nav .btn-solid {
+  margin-left: auto;
+}
+
+@media (min-width: 820px) {
+  .onboarding {
+    grid-template-columns: var(--rail) minmax(0, 1fr);
+  }
+  .onb-rail {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    padding: 34px 28px 26px;
+    border-right: 1px solid var(--line);
+    background: linear-gradient(180deg, var(--bg-soft), var(--bg));
+  }
+  .onb-pane {
+    padding: 56px 64px;
+    max-width: none;
+    margin: 0;
+    justify-content: center;
+  }
+  .onb-phone-steps {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}

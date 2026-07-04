@@ -59,6 +59,55 @@ WaterDrop uses [Tailscale](https://tailscale.com/download) to make your PC reach
 
 WaterDrop can still run locally without Tailscale, but the phone QR flow needs a connected tailnet.
 
+## First-Time Setup
+
+The first time you open WaterDrop, a short setup guide walks you from install to
+your first drop. You can re-run it anytime from **Settings → Re-run setup**.
+
+These screenshots are captured from the real app using an example tailnet URL —
+no personal data.
+
+### 1. Welcome
+
+<p align="center">
+  <img src="docs/readme/01-welcome.png" alt="WaterDrop welcome screen" width="820" />
+</p>
+
+### 2. Install Tailscale on this PC
+
+WaterDrop checks that Tailscale is installed, signed in, and connected. Use
+**Re-check** after you install or connect it.
+
+<p align="center">
+  <img src="docs/readme/02-tailscale-pc.png" alt="WaterDrop Tailscale setup step for this PC" width="820" />
+</p>
+
+### 3. Set up your phone
+
+Add your phone to the same Tailscale account so it can reach this computer's shelf.
+
+<p align="center">
+  <img src="docs/readme/03-phone.png" alt="WaterDrop phone setup step" width="820" />
+</p>
+
+### 4. Publish your shelf
+
+Publish the private `/drop` path once so the QR code carries a real,
+phone-ready HTTPS link over Tailscale Serve.
+
+<p align="center">
+  <img src="docs/readme/04-publish.png" alt="WaterDrop publish /drop step" width="820" />
+</p>
+
+### 5. Finish
+
+Choose whether WaterDrop starts automatically at boot, then you land on the
+shelf ready to drop files.
+
+<p align="center">
+  <img src="docs/readme/05-finish.png" alt="WaterDrop finish setup step" width="820" />
+</p>
+
 ## How To Use
 
 1. Open WaterDrop on your PC.

@@ -224,7 +224,7 @@ function wireIpc() {
   }));
 
   ipcMain.handle("waterdrop:set-settings", async (_event, patch) => {
-    const allowed = ["startOnLogin", "startMinimized", "minimizeToTray"];
+    const allowed = ["startOnLogin", "startMinimized", "minimizeToTray", "onboardingComplete"];
     for (const key of allowed) {
       if (Object.prototype.hasOwnProperty.call(patch || {}, key)) {
         dropServer.store.settings[key] = Boolean(patch[key]);
@@ -308,6 +308,17 @@ function wireIpc() {
   });
 
   ipcMain.handle("waterdrop:configure-serve", async () => tailscale.configureServe(dropServer.port));
+
+  // Fresh Tailscale status for the onboarding "re-check" buttons. Unlike
+  // app-info (a startup snapshot), this re-runs the CLI on demand so the guide
+  // reflects the user installing/connecting Tailscale while it is open.
+  ipcMain.handle("waterdrop:tailscale-status", async () => {
+    try {
+      return { ok: true, status: await tailscale.inspect(dropServer.port) };
+    } catch (err) {
+      return { ok: false, message: err.message || "Could not read Tailscale status" };
+    }
+  });
 }
 
 if (gotLock) {

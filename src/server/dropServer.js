@@ -34,6 +34,7 @@ class FileStore {
       startOnLogin: false,
       startMinimized: true,
       minimizeToTray: true,
+      onboardingComplete: false,
     };
   }
 

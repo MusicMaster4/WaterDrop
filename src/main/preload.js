@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld("waterdrop", {
   copyText: (text) => ipcRenderer.invoke("waterdrop:copy-text", text),
   copyImage: (id) => ipcRenderer.invoke("waterdrop:copy-image", id),
   configureServe: () => ipcRenderer.invoke("waterdrop:configure-serve"),
+  tailscaleStatus: () => ipcRenderer.invoke("waterdrop:tailscale-status"),
 
   // Auto-update bridge.
   update: {

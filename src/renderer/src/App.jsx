@@ -1,9 +1,12 @@
 import {
+  ArrowLeft,
+  ArrowRight,
   Check,
   ChevronDown,
   Clock3,
   Copy,
   Download,
+  Droplets,
   ExternalLink,
   FileArchive,
   FileAudio,
@@ -21,12 +24,22 @@ import {
   Server,
   Settings2,
   Shield,
+  ShieldCheck,
+  Smartphone,
   Trash2,
   UploadCloud,
   Wifi,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+const TAILSCALE_URL = "https://tailscale.com/download";
+const TAILSCALE_IOS_URL = "https://apps.apple.com/app/tailscale/id1470499037";
+const TAILSCALE_ANDROID_URL = "https://play.google.com/store/apps/details?id=com.tailscale.ipn";
+
+// First-run setup guide: Welcome → This PC → Phone → Publish → Finish.
+const ONBOARDING_STEPS = ["Welcome", "This PC", "Phone", "Publish", "Finish"];
+const LAST_ONBOARD_STEP = ONBOARDING_STEPS.length - 1;
 
 const apiDefault = {
   getInfo: () => request("api/info"),
@@ -73,6 +86,7 @@ export default function App() {
   const [confirmClear, setConfirmClear] = useState(false);
   const [previewFile, setPreviewFile] = useState(null);
   const [update, setUpdate] = useState(null);
+  const [showOnboarding, setShowOnboarding] = useState(false);
 
   const notify = useCallback((message, kind = "info", action) => {
     if (!message) return;
@@ -117,6 +131,7 @@ export default function App() {
           setAppInfo(desktopInfo);
           setSettings(desktopInfo.settings || {});
           setApi(buildApi(desktopInfo.server.localUrl));
+          if (!desktopInfo.settings?.onboardingComplete) setShowOnboarding(true);
         }
       } catch (err) {
         notify(err.message || "Desktop bridge failed", "warn");
@@ -257,6 +272,23 @@ export default function App() {
     } else {
       notify(result.message || "Setting failed", "warn");
     }
+  }
+
+  async function finishOnboarding({ startOnLogin }) {
+    if (window.waterdrop) {
+      const result = await window.waterdrop.setSettings({
+        onboardingComplete: true,
+        startOnLogin: Boolean(startOnLogin),
+      });
+      if (result.ok) setSettings(result.settings || {});
+    }
+    setShowOnboarding(false);
+    notify("Setup complete", "ok");
+    await refreshInfo({ silent: true });
+  }
+
+  function rerunSetup() {
+    setShowOnboarding(true);
   }
 
   function pickFiles() {
@@ -416,7 +448,17 @@ export default function App() {
   return (
     <>
       <div className="grain" aria-hidden="true" />
-      <div className="shell">
+      {showOnboarding && (
+        <Onboarding
+          network={network}
+          servePublished={Boolean(network.servePathConfigured)}
+          initialStartOnLogin={Boolean(settings.startOnLogin)}
+          onPublish={publishServe}
+          onRefreshInfo={refreshInfo}
+          onFinish={finishOnboarding}
+        />
+      )}
+      <div className="shell" hidden={showOnboarding}>
         <aside className="conn">
           <div className="url-row">
             <div className="url-box mono" title={preferredUrl}>
@@ -498,6 +540,9 @@ export default function App() {
                 onDownload={downloadUpdate}
                 onInstall={installUpdate}
               />
+              <button className="btn btn-ghost btn-sm full-btn" onClick={rerunSetup}>
+                <RefreshCw size={13} /> Re-run setup
+              </button>
             </div>
           )}
 
@@ -643,6 +688,253 @@ export default function App() {
       )}
 
     </>
+  );
+}
+
+function openExternal(url) {
+  if (window.waterdrop?.openExternal) {
+    window.waterdrop.openExternal(url);
+  } else {
+    window.open(url, "_blank", "noreferrer");
+  }
+}
+
+function Onboarding({ network, servePublished, initialStartOnLogin, onPublish, onRefreshInfo, onFinish }) {
+  const [step, setStep] = useState(0);
+  const [direction, setDirection] = useState("fwd");
+  const [tsStatus, setTsStatus] = useState(null);
+  const [tsChecking, setTsChecking] = useState(false);
+  const [publishing, setPublishing] = useState(false);
+  const [startOnLogin, setStartOnLogin] = useState(initialStartOnLogin);
+  const [finishing, setFinishing] = useState(false);
+
+  const checkTailscale = useCallback(async () => {
+    setTsChecking(true);
+    try {
+      if (window.waterdrop?.tailscaleStatus) {
+        const result = await window.waterdrop.tailscaleStatus();
+        setTsStatus(result.ok ? result.status : { found: false });
+      } else {
+        setTsStatus(network || { found: false });
+      }
+    } finally {
+      setTsChecking(false);
+    }
+  }, [network]);
+
+  useEffect(() => {
+    if (step === 1) checkTailscale();
+  }, [step, checkTailscale]);
+
+  function go(next) {
+    setDirection(next > step ? "fwd" : "back");
+    setStep(Math.max(0, Math.min(LAST_ONBOARD_STEP, next)));
+  }
+
+  async function publishNow() {
+    setPublishing(true);
+    try {
+      await onPublish();
+      await onRefreshInfo({ silent: true });
+    } finally {
+      setPublishing(false);
+    }
+  }
+
+  async function finish() {
+    setFinishing(true);
+    await onFinish({ startOnLogin });
+    setFinishing(false);
+  }
+
+  const ts = tsStatus || {};
+  const tsState = !ts.found
+    ? { dot: "dot-warn", msg: "Tailscale isn't installed on this PC yet. Install it, then re-check." }
+    : !ts.loggedIn
+      ? { dot: "dot-warn", msg: "Tailscale is installed but not signed in. Open Tailscale and log in." }
+      : !ts.running
+        ? { dot: "dot-warn", msg: "Tailscale is signed in but not connected. Connect it, then re-check." }
+        : { dot: "dot-ok", msg: ts.dnsName ? `Connected as ${ts.dnsName}` : "Connected and ready." };
+
+  return (
+    <section className="onboarding">
+      <aside className="onb-rail">
+        <div className="onb-brand">
+          <span className="onb-brand-mark"><Droplets size={20} strokeWidth={1.6} /></span>
+          <span className="onb-brand-name">WaterDrop</span>
+        </div>
+        <ol className="onb-steps">
+          {ONBOARDING_STEPS.map((label, i) => (
+            <li className="onb-step" key={label}>
+              <span className={`onb-dot ${i < step ? "is-done" : i === step ? "is-active" : ""}`}>
+                {i < step ? <Check size={11} strokeWidth={3} /> : i + 1}
+              </span>
+              <span className={`onb-label ${i === step ? "is-active" : ""}`}>{label}</span>
+            </li>
+          ))}
+        </ol>
+        <p className="onb-foot mono small faint">Private file shelf, your network only.</p>
+      </aside>
+
+      <div className="onb-pane">
+        <div className="onb-body">
+          <div className={`onb-view onb-anim-${direction}`} key={step}>
+            {step === 0 && (
+              <div className="onb-welcome">
+                <span className="onb-iris" aria-hidden="true" />
+                <span className="onb-hero-mark"><Droplets size={54} strokeWidth={1.3} /></span>
+                <h1 className="onb-title">Welcome to WaterDrop</h1>
+                <p className="onb-lead">
+                  A private, AirDrop-style shelf for your files — served straight from this PC
+                  over your own Tailscale network. No cloud, no accounts, no public links.
+                </p>
+                <ul className="onb-chips">
+                  <li>Private Tailscale link</li>
+                  <li>Original bytes, no re-encoding</li>
+                  <li>QR pairing with your phone</li>
+                </ul>
+              </div>
+            )}
+
+            {step === 1 && (
+              <div className="onb-step-body">
+                <h1 className="onb-title">Install Tailscale on this PC</h1>
+                <p className="onb-lead">
+                  WaterDrop reaches your phone through Tailscale — a private tunnel between
+                  your own devices. Install it here and sign in to your account.
+                </p>
+                <div className="onb-card">
+                  <div className="status-line">
+                    <span className={`dot ${tsChecking ? "dot-idle" : tsState.dot}`} />
+                    <span>{tsChecking ? "Checking Tailscale…" : tsState.msg}</span>
+                  </div>
+                </div>
+                <div className="onb-actions">
+                  <button className="btn btn-ghost btn-sm" onClick={() => openExternal(TAILSCALE_URL)}>
+                    <ExternalLink size={14} /> Get Tailscale
+                  </button>
+                  <button className="btn btn-ghost btn-sm" onClick={checkTailscale} disabled={tsChecking}>
+                    <RefreshCw size={14} /> Re-check
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {step === 2 && (
+              <div className="onb-step-body">
+                <h1 className="onb-title">Set up your phone</h1>
+                <p className="onb-lead">
+                  Add your phone to the <b>same</b> Tailscale account so it can reach this
+                  computer's shelf.
+                </p>
+                <div className="onb-phone-steps">
+                  <div className="onb-phone-step">
+                    <span className="onb-phone-num">1</span>
+                    <h3 className="onb-phone-title">Install</h3>
+                    <p className="onb-phone-desc">Get the Tailscale app.</p>
+                    <div className="onb-phone-links">
+                      <button className="onb-link" onClick={() => openExternal(TAILSCALE_IOS_URL)}>App Store ↗</button>
+                      <button className="onb-link" onClick={() => openExternal(TAILSCALE_ANDROID_URL)}>Google Play ↗</button>
+                    </div>
+                  </div>
+                  <div className="onb-phone-step">
+                    <span className="onb-phone-num">2</span>
+                    <h3 className="onb-phone-title">Sign in</h3>
+                    <p className="onb-phone-desc">Use the same account as this PC.</p>
+                  </div>
+                  <div className="onb-phone-step">
+                    <span className="onb-phone-num">3</span>
+                    <h3 className="onb-phone-title">Connect</h3>
+                    <p className="onb-phone-desc">Turn Tailscale on and keep it connected.</p>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {step === 3 && (
+              <div className="onb-step-body">
+                <h1 className="onb-title">Publish your shelf</h1>
+                <p className="onb-lead">
+                  WaterDrop shares files at a private <span className="mono">/drop</span> path over
+                  Tailscale Serve. Publish it once so the QR code carries a real phone-ready link.
+                </p>
+                <div className="onb-card">
+                  <div className="status-line">
+                    <span className={`dot ${servePublished ? "dot-ok" : "dot-warn"}`} />
+                    <span>
+                      {servePublished
+                        ? "/drop is published over Tailscale Serve."
+                        : "/drop isn't published yet."}
+                    </span>
+                  </div>
+                  {network?.preferredUrl && (
+                    <div className="onb-url mono small" title={network.preferredUrl}>{network.preferredUrl}</div>
+                  )}
+                </div>
+                <div className="onb-actions">
+                  <button className="btn btn-solid btn-sm" onClick={publishNow} disabled={publishing || servePublished}>
+                    <MonitorUp size={14} /> {servePublished ? "Published" : publishing ? "Publishing…" : "Publish /drop"}
+                  </button>
+                  <button className="btn btn-ghost btn-sm" onClick={() => onRefreshInfo()}>
+                    <RefreshCw size={14} /> Refresh
+                  </button>
+                </div>
+                <p className="onb-note mono small faint">
+                  No Tailscale yet? You can still publish later from the main window.
+                </p>
+              </div>
+            )}
+
+            {step === 4 && (
+              <div className="onb-step-body">
+                <span className="onb-hero-mark onb-hero-mark-sm"><ShieldCheck size={44} strokeWidth={1.35} /></span>
+                <h1 className="onb-title">You're all set</h1>
+                <p className="onb-lead">
+                  Drop files into WaterDrop, scan the QR code with your phone, and grab them from the
+                  shelf. Should WaterDrop start automatically when this computer boots?
+                </p>
+                <div className="onb-segmented" role="radiogroup" aria-label="Start on login">
+                  <button
+                    type="button"
+                    className={`onb-seg ${startOnLogin ? "is-selected" : ""}`}
+                    role="radio"
+                    aria-checked={startOnLogin}
+                    onClick={() => setStartOnLogin(true)}
+                  >
+                    Yes, start on boot
+                  </button>
+                  <button
+                    type="button"
+                    className={`onb-seg ${!startOnLogin ? "is-selected" : ""}`}
+                    role="radio"
+                    aria-checked={!startOnLogin}
+                    onClick={() => setStartOnLogin(false)}
+                  >
+                    No, I'll open it
+                  </button>
+                </div>
+                <p className="onb-note mono small faint">You can change this anytime in Settings.</p>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="onb-nav">
+          <button className="btn btn-ghost" onClick={() => go(step - 1)} hidden={step === 0}>
+            <ArrowLeft size={15} /> Back
+          </button>
+          {step === LAST_ONBOARD_STEP ? (
+            <button className="btn btn-solid" onClick={finish} disabled={finishing}>
+              {finishing ? "Finishing…" : "Finish"} <Check size={15} />
+            </button>
+          ) : (
+            <button className="btn btn-solid" onClick={() => go(step + 1)}>
+              Next <ArrowRight size={15} />
+            </button>
+          )}
+        </div>
+      </div>
+    </section>
   );
 }
 
