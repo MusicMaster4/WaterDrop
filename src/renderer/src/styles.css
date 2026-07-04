@@ -1119,14 +1119,11 @@ body::before {
   gap: 10px;
 }
 .onb-brand-mark {
-  display: inline-grid;
-  place-items: center;
   width: 34px;
   height: 34px;
   border-radius: 9px;
-  border: 1px solid var(--line-strong);
-  background: var(--panel);
-  color: var(--ink);
+  object-fit: cover;
+  display: block;
 }
 .onb-brand-name {
   font-family: var(--display);
@@ -1261,19 +1258,23 @@ body::before {
   pointer-events: none;
 }
 .onb-hero-mark {
-  display: inline-grid;
-  place-items: center;
   width: 84px;
   height: 84px;
   border-radius: 20px;
-  border: 1px solid var(--line-strong);
-  background: var(--panel);
-  color: var(--ink);
+  object-fit: cover;
+  display: block;
   margin-bottom: 20px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
 }
 .onb-hero-mark-sm {
+  display: inline-grid;
+  place-items: center;
   width: 72px;
   height: 72px;
+  border-radius: 18px;
+  border: 1px solid var(--line-strong);
+  background: var(--panel);
+  box-shadow: none;
   color: var(--ok);
 }
 .onb-chips {

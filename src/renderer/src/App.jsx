@@ -6,7 +6,6 @@ import {
   Clock3,
   Copy,
   Download,
-  Droplets,
   ExternalLink,
   FileArchive,
   FileAudio,
@@ -32,6 +31,7 @@ import {
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import logoUrl from "./logo.png";
 
 const TAILSCALE_URL = "https://tailscale.com/download";
 const TAILSCALE_IOS_URL = "https://apps.apple.com/app/tailscale/id1470499037";
@@ -760,7 +760,7 @@ function Onboarding({ network, servePublished, initialStartOnLogin, onPublish, o
     <section className="onboarding">
       <aside className="onb-rail">
         <div className="onb-brand">
-          <span className="onb-brand-mark"><Droplets size={20} strokeWidth={1.6} /></span>
+          <img className="onb-brand-mark" src={logoUrl} alt="WaterDrop logo" />
           <span className="onb-brand-name">WaterDrop</span>
         </div>
         <ol className="onb-steps">
@@ -782,7 +782,7 @@ function Onboarding({ network, servePublished, initialStartOnLogin, onPublish, o
             {step === 0 && (
               <div className="onb-welcome">
                 <span className="onb-iris" aria-hidden="true" />
-                <span className="onb-hero-mark"><Droplets size={54} strokeWidth={1.3} /></span>
+                <img className="onb-hero-mark" src={logoUrl} alt="WaterDrop logo" />
                 <h1 className="onb-title">Welcome to WaterDrop</h1>
                 <p className="onb-lead">
                   A private, AirDrop-style shelf for your files — served straight from this PC
