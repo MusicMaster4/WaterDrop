@@ -1,6 +1,8 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
+const http = require("node:http");
 const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
@@ -18,14 +20,23 @@ test("uploads, lists, previews, downloads, deletes, and clears files", async () 
   const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 47950 });
   try {
     const base = server.localUrl;
-    const form = new FormData();
-    form.append("files", new Blob(["abcdef"]), "sample.txt");
+    const expectedHash = sha256(Buffer.from("abcdef"));
 
-    const upload = await fetch(new URL("api/files", base), { method: "POST", body: form });
+    const upload = await fetch(new URL("api/files/raw", base), {
+      method: "POST",
+      body: new Blob(["abcdef"], { type: "text/plain" }),
+      headers: {
+        "Content-Type": "text/plain",
+        "X-WaterDrop-File-Name": encodeURIComponent("sample.txt"),
+        "X-WaterDrop-Mime-Type": "text/plain",
+      },
+    });
     assert.equal(upload.status, 201);
     const uploadBody = await upload.json();
     assert.equal(uploadBody.files.length, 1);
     assert.equal(uploadBody.files[0].name, "sample.txt");
+    assert.equal(uploadBody.files[0].size, 6);
+    assert.equal(uploadBody.files[0].sha256, expectedHash);
 
     const listed = await fetch(new URL("api/files", base));
     assert.equal(listed.status, 200);
@@ -41,9 +52,19 @@ test("uploads, lists, previews, downloads, deletes, and clears files", async () 
     assert.equal(strippedStatic.status, 200);
 
     const id = listedBody.files[0].id;
+    const head = await fetch(new URL(`api/files/${id}/download`, base), { method: "HEAD" });
+    assert.equal(head.status, 200);
+    assert.equal(head.headers.get("accept-ranges"), "bytes");
+    assert.equal(head.headers.get("content-length"), "6");
+    assert.equal(head.headers.get("x-waterdrop-sha256"), expectedHash);
+
+    const afterHead = await fetch(new URL("api/files", base));
+    const afterHeadBody = await afterHead.json();
+    assert.equal(afterHeadBody.files[0].downloads, 0);
+
     const preview = await fetch(new URL(`api/files/${id}/preview`, base));
     assert.equal(preview.status, 200);
-    assert.equal(preview.headers.get("content-disposition"), 'inline; filename="sample.txt"');
+    assert.match(preview.headers.get("content-disposition"), /^inline; filename="sample\.txt"/);
     assert.equal(await preview.text(), "abcdef");
 
     const afterPreview = await fetch(new URL("api/files", base));
@@ -56,6 +77,13 @@ test("uploads, lists, previews, downloads, deletes, and clears files", async () 
     assert.equal(ranged.status, 206);
     assert.equal(ranged.headers.get("content-range"), "bytes 1-3/6");
     assert.equal(await ranged.text(), "bcd");
+
+    const fullDownload = await fetch(new URL(`api/files/${id}/download`, base));
+    assert.equal(fullDownload.status, 200);
+    const fullDownloadBytes = Buffer.from(await fullDownload.arrayBuffer());
+    assert.equal(fullDownloadBytes.equals(Buffer.from("abcdef")), true);
+    assert.equal(sha256(fullDownloadBytes), expectedHash);
+    await waitForDownloads(base, id, 2);
 
     const dragPath = server.store.prepareDragFile(id);
     assert.equal(path.basename(dragPath), "sample.txt");
@@ -91,3 +119,80 @@ test("uploads, lists, previews, downloads, deletes, and clears files", async () 
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test("file change events are emitted as soon as uploads are committed", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-events-test-"));
+  const rendererDir = path.join(root, "renderer");
+  const dataDir = path.join(root, "data");
+  const downloads = path.join(root, "downloads");
+  await fs.mkdir(rendererDir, { recursive: true });
+  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>WaterDrop</title>");
+
+  const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 47980 });
+  try {
+    const eventPromise = waitForFileEvent(new URL("api/events", server.localUrl));
+    const form = new FormData();
+    form.append("files", new Blob(["event-body"]), "event.txt");
+
+    const upload = await fetch(new URL("api/files", server.localUrl), { method: "POST", body: form });
+    assert.equal(upload.status, 201);
+
+    const event = await eventPromise;
+    assert.equal(event.reason, "upload");
+    assert.equal(typeof event.at, "number");
+  } finally {
+    await server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+function sha256(buffer) {
+  return crypto.createHash("sha256").update(buffer).digest("hex");
+}
+
+function waitForFileEvent(url) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(url, (res) => {
+      let eventName = null;
+      let data = "";
+      let buffer = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        buffer += chunk;
+        let splitAt;
+        while ((splitAt = buffer.indexOf("\n\n")) !== -1) {
+          const block = buffer.slice(0, splitAt);
+          buffer = buffer.slice(splitAt + 2);
+          eventName = null;
+          data = "";
+          for (const line of block.split("\n")) {
+            if (line.startsWith("event:")) eventName = line.slice(6).trim();
+            if (line.startsWith("data:")) data += line.slice(5).trim();
+          }
+          if (eventName === "files" && data) {
+            req.destroy();
+            resolve(JSON.parse(data));
+            return;
+          }
+        }
+      });
+    });
+    req.setTimeout(3000, () => {
+      req.destroy();
+      reject(new Error("Timed out waiting for file event"));
+    });
+    req.on("error", reject);
+  });
+}
+
+async function waitForDownloads(base, id, expected) {
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline) {
+    const listed = await fetch(new URL("api/files", base));
+    const body = await listed.json();
+    const file = body.files.find((entry) => entry.id === id);
+    if ((file?.downloads || 0) >= expected) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`Timed out waiting for ${expected} downloads`);
+}

@@ -44,7 +44,9 @@ const LAST_ONBOARD_STEP = ONBOARDING_STEPS.length - 1;
 const apiDefault = {
   getInfo: () => request("api/info"),
   getFiles: () => request("api/files"),
+  eventsUrl: "api/events",
   uploadUrl: "api/files",
+  rawUploadUrl: "api/files/raw",
   downloadUrl: (id) => `api/files/${id}/download`,
   previewUrl: (id) => `api/files/${id}/preview`,
   clearFiles: () => request("api/files", { method: "DELETE" }),
@@ -58,7 +60,9 @@ function buildApi(baseUrl = "") {
   return {
     getInfo: () => request(join("api/info")),
     getFiles: () => request(join("api/files")),
+    eventsUrl: join("api/events"),
     uploadUrl: join("api/files"),
+    rawUploadUrl: join("api/files/raw"),
     downloadUrl: (id) => join(`api/files/${id}/download`),
     previewUrl: (id) => join(`api/files/${id}/preview`),
     clearFiles: () => request(join("api/files"), { method: "DELETE" }),
@@ -154,7 +158,12 @@ export default function App() {
   useEffect(() => {
     if (busy) return undefined;
     const refreshQuietly = () => refreshFiles({ silent: true });
-    const interval = window.setInterval(refreshQuietly, 3000);
+    const interval = window.setInterval(refreshQuietly, window.EventSource ? 15000 : 3000);
+    let events = null;
+    if (window.EventSource && api.eventsUrl) {
+      events = new EventSource(api.eventsUrl);
+      events.addEventListener("files", refreshQuietly);
+    }
     const onVisible = () => {
       if (document.visibilityState === "visible") {
         refreshQuietly();
@@ -164,9 +173,10 @@ export default function App() {
     document.addEventListener("visibilitychange", onVisible);
     return () => {
       window.clearInterval(interval);
+      events?.close();
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [busy, refreshFiles, refreshInfo]);
+  }, [api, busy, refreshFiles, refreshInfo]);
 
   // Tailscale Serve publishes a few seconds after launch. Poll the network only
   // until the QR carries the real phone link (serve path published), then stop —
@@ -339,11 +349,14 @@ export default function App() {
       { id, name: file.name, size: file.size, progress: 0, status: "uploading" },
     ]);
 
-    const data = new FormData();
-    data.append("files", file, file.name);
-
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", api.uploadUrl, true);
+    const useRawUpload = Boolean(api.rawUploadUrl);
+    xhr.open("POST", useRawUpload ? api.rawUploadUrl : api.uploadUrl, true);
+    if (useRawUpload) {
+      xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
+      xhr.setRequestHeader("X-WaterDrop-File-Name", encodeURIComponent(file.name || "unnamed-file"));
+      xhr.setRequestHeader("X-WaterDrop-Mime-Type", file.type || "application/octet-stream");
+    }
     xhr.upload.onprogress = (event) => {
       if (!event.lengthComputable) return;
       const progress = Math.round((event.loaded / event.total) * 100);
@@ -373,7 +386,13 @@ export default function App() {
       );
       notify(`Upload failed: ${file.name}`, "warn");
     };
-    xhr.send(data);
+    if (useRawUpload) {
+      xhr.send(file);
+    } else {
+      const data = new FormData();
+      data.append("files", file, file.name);
+      xhr.send(data);
+    }
   }
 
   async function downloadFile(file) {

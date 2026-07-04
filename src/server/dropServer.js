@@ -3,6 +3,7 @@
 const Busboy = require("busboy");
 const QRCode = require("qrcode");
 const crypto = require("crypto");
+const EventEmitter = require("events");
 const fs = require("fs");
 const http = require("http");
 const mime = require("mime-types");
@@ -16,10 +17,15 @@ const fsp = fs.promises;
 const BASE_PATH = "/drop";
 const DEFAULT_PORT = 41737;
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
-const DOWNLOAD_HIGH_WATER_MARK = 1024 * 1024;
+const UPLOAD_HIGH_WATER_MARK = 1024 * 1024;
+const DOWNLOAD_HIGH_WATER_MARK = 8 * 1024 * 1024;
+const SSE_HEARTBEAT_MS = 25 * 1000;
+const DOWNLOAD_RECORD_DELAY_MS = 25;
+const DOWNLOAD_METADATA_DEBOUNCE_MS = 1000;
 
-class FileStore {
+class FileStore extends EventEmitter {
   constructor({ dataDir, defaultDownloadDir }) {
+    super();
     this.dataDir = dataDir;
     this.filesDir = path.join(dataDir, "files");
     this.tmpDir = path.join(dataDir, "tmp");
@@ -27,6 +33,9 @@ class FileStore {
     this.metaPath = path.join(dataDir, "files.json");
     this.settingsPath = path.join(dataDir, "settings.json");
     this.defaultDownloadDir = defaultDownloadDir;
+    this.filesSaveQueue = Promise.resolve();
+    this.pendingDownloadRecords = new Set();
+    this.pendingDownloadSaveTimer = null;
     this.files = [];
     this.settings = {
       downloadDir: defaultDownloadDir,
@@ -55,7 +64,10 @@ class FileStore {
   }
 
   async saveFiles() {
-    await writeJsonAtomic(this.metaPath, this.files);
+    this.filesSaveQueue = this.filesSaveQueue
+      .catch(() => {})
+      .then(() => writeJsonAtomic(this.metaPath, this.files));
+    await this.filesSaveQueue;
   }
 
   async saveSettings() {
@@ -102,15 +114,60 @@ class FileStore {
     };
     this.files.push(entry);
     await this.saveFiles();
+    this.notifyFilesChanged("upload");
     return toPublicFile(entry);
   }
 
   async recordDownload(id) {
+    if (!this.applyDownloadRecord(id)) return;
+    await this.saveFiles();
+  }
+
+  applyDownloadRecord(id) {
     const file = this.files.find((entry) => entry.id === id);
-    if (!file) return;
+    if (!file) return false;
     file.downloads = Number(file.downloads || 0) + 1;
     file.lastDownloadedAt = Date.now();
-    await this.saveFiles();
+    this.notifyFilesChanged("download");
+    return true;
+  }
+
+  scheduleDownloadRecord(id) {
+    const entry = { id, timer: null };
+    entry.timer = setTimeout(() => {
+      this.pendingDownloadRecords.delete(entry);
+      if (this.applyDownloadRecord(id)) this.scheduleDownloadSave();
+    }, DOWNLOAD_RECORD_DELAY_MS);
+    entry.timer.unref();
+    this.pendingDownloadRecords.add(entry);
+  }
+
+  scheduleDownloadSave() {
+    if (this.pendingDownloadSaveTimer) {
+      clearTimeout(this.pendingDownloadSaveTimer);
+    }
+    this.pendingDownloadSaveTimer = setTimeout(() => {
+      this.pendingDownloadSaveTimer = null;
+      this.saveFiles().catch((err) => console.error("Could not save download metadata", err));
+    }, DOWNLOAD_METADATA_DEBOUNCE_MS);
+    this.pendingDownloadSaveTimer.unref();
+  }
+
+  async flushPendingDownloadRecords() {
+    const pending = Array.from(this.pendingDownloadRecords);
+    const hadPendingSave = Boolean(this.pendingDownloadSaveTimer);
+    this.pendingDownloadRecords.clear();
+    if (this.pendingDownloadSaveTimer) {
+      clearTimeout(this.pendingDownloadSaveTimer);
+      this.pendingDownloadSaveTimer = null;
+    }
+
+    let changed = false;
+    for (const entry of pending) {
+      clearTimeout(entry.timer);
+      changed = this.applyDownloadRecord(entry.id) || changed;
+    }
+    if (changed || hadPendingSave) await this.saveFiles();
   }
 
   async delete(id) {
@@ -120,6 +177,7 @@ class FileStore {
     await removeIfExists(this.pathFor(file));
     await removeDirIfExists(path.join(this.dragDir, file.id));
     await this.saveFiles();
+    this.notifyFilesChanged("delete");
     return true;
   }
 
@@ -130,6 +188,7 @@ class FileStore {
     await removeDirIfExists(this.dragDir);
     await fsp.mkdir(this.dragDir, { recursive: true });
     await this.saveFiles();
+    if (files.length) this.notifyFilesChanged("clear");
     return files.length;
   }
 
@@ -165,10 +224,7 @@ class FileStore {
     const destinationDir = targetDir || this.settings.downloadDir || this.defaultDownloadDir;
     await fsp.mkdir(destinationDir, { recursive: true });
     const destination = await uniqueDestination(destinationDir, file.name);
-    await streamPipeline(
-      fs.createReadStream(this.pathFor(file), { highWaterMark: DOWNLOAD_HIGH_WATER_MARK }),
-      fs.createWriteStream(destination)
-    );
+    await fsp.copyFile(this.pathFor(file), destination);
     return destination;
   }
 
@@ -184,20 +240,26 @@ class FileStore {
       ])
     );
     await this.saveFiles();
+    this.notifyFilesChanged("expire");
     return expired.length;
   }
 
   pathFor(file) {
     return path.join(this.filesDir, file.storedName);
   }
+
+  notifyFilesChanged(reason) {
+    this.emit("files-changed", { reason, at: Date.now() });
+  }
 }
 
 async function createDropServer({ dataDir, defaultDownloadDir, rendererDir, port = DEFAULT_PORT }) {
   const store = new FileStore({ dataDir, defaultDownloadDir });
   await store.init();
+  const eventClients = new Set();
 
   const server = http.createServer((req, res) => {
-    handleRequest({ req, res, store, rendererDir, getPort: () => actualPort }).catch((err) => {
+    handleRequest({ req, res, store, rendererDir, getPort: () => actualPort, eventClients }).catch((err) => {
       if (err?.code === "UPLOAD_ABORTED") return;
       console.error(err);
       sendJson(res, 500, { error: "Internal server error" });
@@ -215,14 +277,16 @@ async function createDropServer({ dataDir, defaultDownloadDir, rendererDir, port
     basePath: BASE_PATH,
     localUrl: `http://127.0.0.1:${actualPort}${BASE_PATH}/`,
     store,
-    close() {
+    async close() {
       clearInterval(cleanupTimer);
-      return new Promise((resolve) => server.close(resolve));
+      for (const client of eventClients) client.end();
+      await new Promise((resolve) => server.close(resolve));
+      await store.flushPendingDownloadRecords();
     },
   };
 }
 
-async function handleRequest({ req, res, store, rendererDir, getPort }) {
+async function handleRequest({ req, res, store, rendererDir, getPort, eventClients }) {
   if (!isAllowedRemote(req.socket.remoteAddress)) {
     sendJson(res, 403, { error: "WaterDrop only accepts loopback or Tailscale clients." });
     return;
@@ -243,14 +307,14 @@ async function handleRequest({ req, res, store, rendererDir, getPort }) {
   }
 
   if (pathname.startsWith("/api/")) {
-    await handleApi({ req, res, url, relative: pathname, store, getPort });
+    await handleApi({ req, res, url, relative: pathname, store, getPort, eventClients });
     return;
   }
 
   if (pathname.startsWith(`${BASE_PATH}/`)) {
     const relative = pathname.slice(BASE_PATH.length);
     if (relative.startsWith("/api/")) {
-      await handleApi({ req, res, url, relative, store, getPort });
+      await handleApi({ req, res, url, relative, store, getPort, eventClients });
       return;
     }
     await serveStatic({ req, res, pathname: relative, rendererDir });
@@ -265,7 +329,7 @@ async function handleRequest({ req, res, store, rendererDir, getPort }) {
   sendJson(res, 404, { error: "Not found" });
 }
 
-async function handleApi({ req, res, relative, store, getPort }) {
+async function handleApi({ req, res, relative, store, getPort, eventClients }) {
   if (relative.startsWith(BASE_PATH + "/api/")) {
     relative = relative.slice(BASE_PATH.length);
   }
@@ -299,8 +363,18 @@ async function handleApi({ req, res, relative, store, getPort }) {
     return;
   }
 
+  if (req.method === "GET" && relative === "/api/events") {
+    handleEvents(req, res, store, eventClients);
+    return;
+  }
+
   if (req.method === "POST" && relative === "/api/files") {
     await handleUpload(req, res, store);
+    return;
+  }
+
+  if (req.method === "POST" && relative === "/api/files/raw") {
+    await handleRawUpload(req, res, store);
     return;
   }
 
@@ -314,11 +388,11 @@ async function handleApi({ req, res, relative, store, getPort }) {
   if (fileMatch) {
     const id = fileMatch[1];
     const action = fileMatch[2];
-    if (req.method === "GET" && action === "download") {
+    if ((req.method === "GET" || req.method === "HEAD") && action === "download") {
       await handleDownload(req, res, store, id);
       return;
     }
-    if (req.method === "GET" && action === "preview") {
+    if ((req.method === "GET" || req.method === "HEAD") && action === "preview") {
       await handlePreview(req, res, store, id);
       return;
     }
@@ -332,6 +406,47 @@ async function handleApi({ req, res, relative, store, getPort }) {
   sendJson(res, 404, { error: "API route not found" });
 }
 
+async function handleRawUpload(req, res, store) {
+  const originalName = decodeHeaderValue(req.headers["x-waterdrop-file-name"]) || "unnamed-file";
+  const mimeType = cleanHeaderValue(req.headers["x-waterdrop-mime-type"]) || cleanMimeType(req.headers["content-type"]);
+  const id = crypto.randomUUID();
+  const tempPath = path.join(store.tmpDir, `${id}.upload`);
+  const hash = crypto.createHash("sha256");
+  let size = 0;
+
+  const meter = new Transform({
+    transform(chunk, _encoding, callback) {
+      size += chunk.length;
+      hash.update(chunk);
+      callback(null, chunk);
+    },
+  });
+
+  try {
+    await streamPipeline(
+      req,
+      meter,
+      fs.createWriteStream(tempPath, { highWaterMark: UPLOAD_HIGH_WATER_MARK })
+    );
+    const file = await store.addFromTemp({
+      id,
+      tempPath,
+      originalName,
+      mimeType,
+      size,
+      sha256: hash.digest("hex"),
+    });
+    sendJson(res, 201, { files: [file] });
+  } catch (err) {
+    await removeIfExists(tempPath);
+    if (req.aborted) {
+      err.code = "UPLOAD_ABORTED";
+      throw err;
+    }
+    sendJson(res, 500, { error: `Upload failed: ${err.message}` });
+  }
+}
+
 async function handleUpload(req, res, store) {
   const contentType = req.headers["content-type"] || "";
   if (!contentType.includes("multipart/form-data")) {
@@ -341,6 +456,8 @@ async function handleUpload(req, res, store) {
 
   const busboy = Busboy({
     headers: req.headers,
+    highWaterMark: UPLOAD_HIGH_WATER_MARK,
+    fileHwm: UPLOAD_HIGH_WATER_MARK,
     limits: { files: 128 },
   });
   const uploadPromises = [];
@@ -365,7 +482,7 @@ async function handleUpload(req, res, store) {
     const promise = streamPipeline(
       fileStream,
       meter,
-      fs.createWriteStream(tempPath, { highWaterMark: DOWNLOAD_HIGH_WATER_MARK })
+      fs.createWriteStream(tempPath, { highWaterMark: UPLOAD_HIGH_WATER_MARK })
     ).then(() =>
       store.addFromTemp({
         id,
@@ -411,11 +528,36 @@ async function handleUpload(req, res, store) {
     const files = await Promise.all(uploadPromises);
     sendJson(res, 201, { files });
   } catch (err) {
+    await Promise.allSettled(tempPaths.map((tempPath) => removeIfExists(tempPath)));
     sendJson(res, 500, { error: `Upload failed: ${err.message}` });
   }
 }
 
 async function handleDownload(req, res, store, id) {
+  await sendStoredFile({
+    req,
+    res,
+    store,
+    id,
+    disposition: "attachment",
+    cacheControl: "private, max-age=0, no-transform",
+    recordDownload: true,
+  });
+}
+
+async function handlePreview(req, res, store, id) {
+  await sendStoredFile({
+    req,
+    res,
+    store,
+    id,
+    disposition: "inline",
+    cacheControl: "private, max-age=60, no-transform",
+    recordDownload: false,
+  });
+}
+
+async function sendStoredFile({ req, res, store, id, disposition, cacheControl, recordDownload }) {
   const file = store.get(id);
   if (!file) {
     sendJson(res, 404, { error: "File not found" });
@@ -436,9 +578,11 @@ async function handleDownload(req, res, store, id) {
   const commonHeaders = {
     ...corsHeaders(),
     "Accept-Ranges": "bytes",
-    "Cache-Control": "private, max-age=0, no-transform",
-    "Content-Disposition": `attachment; filename="${asciiFileName(file.name)}"; filename*=UTF-8''${encodedName}`,
+    "Cache-Control": cacheControl,
+    "Content-Disposition": `${disposition}; filename="${asciiFileName(file.name)}"; filename*=UTF-8''${encodedName}`,
     "Content-Type": file.mimeType || "application/octet-stream",
+    "ETag": `"sha256-${file.sha256}"`,
+    "Last-Modified": new Date(file.createdAt).toUTCString(),
     "X-Content-Type-Options": "nosniff",
     "X-WaterDrop-SHA256": file.sha256,
   };
@@ -449,7 +593,7 @@ async function handleDownload(req, res, store, id) {
     return;
   }
 
-  await store.recordDownload(id);
+  if (recordDownload && req.method !== "HEAD") recordDownloadAfterResponse(res, store, id);
 
   if (range) {
     res.writeHead(206, {
@@ -457,11 +601,15 @@ async function handleDownload(req, res, store, id) {
       "Content-Length": range.end - range.start + 1,
       "Content-Range": `bytes ${range.start}-${range.end}/${stat.size}`,
     });
-    fs.createReadStream(filePath, {
+    if (req.method === "HEAD") {
+      res.end();
+      return;
+    }
+    pipeFileToResponse(res, filePath, {
       start: range.start,
       end: range.end,
-      highWaterMark: DOWNLOAD_HIGH_WATER_MARK,
-    }).pipe(res);
+      highWaterMark: Math.min(DOWNLOAD_HIGH_WATER_MARK, range.end - range.start + 1),
+    });
     return;
   }
 
@@ -469,61 +617,26 @@ async function handleDownload(req, res, store, id) {
     ...commonHeaders,
     "Content-Length": stat.size,
   });
-  fs.createReadStream(filePath, { highWaterMark: DOWNLOAD_HIGH_WATER_MARK }).pipe(res);
+  if (req.method === "HEAD") {
+    res.end();
+    return;
+  }
+  pipeFileToResponse(res, filePath, { highWaterMark: DOWNLOAD_HIGH_WATER_MARK });
 }
 
-async function handlePreview(req, res, store, id) {
-  const file = store.get(id);
-  if (!file) {
-    sendJson(res, 404, { error: "File not found" });
-    return;
-  }
-
-  const filePath = store.pathFor(file);
-  let stat;
-  try {
-    stat = await fsp.stat(filePath);
-  } catch {
-    sendJson(res, 404, { error: "File payload is missing" });
-    return;
-  }
-
-  const range = parseRange(req.headers.range, stat.size);
-  const commonHeaders = {
-    ...corsHeaders(),
-    "Accept-Ranges": "bytes",
-    "Cache-Control": "private, max-age=60, no-transform",
-    "Content-Disposition": `inline; filename="${asciiFileName(file.name)}"`,
-    "Content-Type": file.mimeType || mime.lookup(file.name) || "application/octet-stream",
-    "X-Content-Type-Options": "nosniff",
-    "X-WaterDrop-SHA256": file.sha256,
-  };
-
-  if (range && range.invalid) {
-    res.writeHead(416, { ...commonHeaders, "Content-Range": `bytes */${stat.size}` });
-    res.end();
-    return;
-  }
-
-  if (range) {
-    res.writeHead(206, {
-      ...commonHeaders,
-      "Content-Length": range.end - range.start + 1,
-      "Content-Range": `bytes ${range.start}-${range.end}/${stat.size}`,
-    });
-    fs.createReadStream(filePath, {
-      start: range.start,
-      end: range.end,
-      highWaterMark: DOWNLOAD_HIGH_WATER_MARK,
-    }).pipe(res);
-    return;
-  }
-
-  res.writeHead(200, {
-    ...commonHeaders,
-    "Content-Length": stat.size,
+function pipeFileToResponse(res, filePath, options) {
+  const fileStream = fs.createReadStream(filePath, options);
+  fileStream.on("error", (err) => {
+    if (!res.destroyed) res.destroy(err);
   });
-  fs.createReadStream(filePath, { highWaterMark: DOWNLOAD_HIGH_WATER_MARK }).pipe(res);
+  res.on("close", () => fileStream.destroy());
+  fileStream.pipe(res);
+}
+
+function recordDownloadAfterResponse(res, store, id) {
+  res.once("finish", () => {
+    store.scheduleDownloadRecord(id);
+  });
 }
 
 async function serveStatic({ req, res, pathname, rendererDir }) {
@@ -569,7 +682,40 @@ async function serveStatic({ req, res, pathname, rendererDir }) {
     res.end();
     return;
   }
-  fs.createReadStream(filePath).pipe(res);
+  pipeFileToResponse(res, filePath, { highWaterMark: DOWNLOAD_HIGH_WATER_MARK });
+}
+
+function handleEvents(req, res, store, eventClients) {
+  res.writeHead(200, {
+    ...corsHeaders(),
+    "Cache-Control": "no-store, no-transform",
+    "Connection": "keep-alive",
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "X-Accel-Buffering": "no",
+  });
+  eventClients.add(res);
+  res.write(": connected\n\n");
+
+  const sendChange = (event) => writeSse(res, "files", event);
+  const heartbeat = setInterval(() => res.write(": keep-alive\n\n"), SSE_HEARTBEAT_MS);
+  heartbeat.unref();
+  store.on("files-changed", sendChange);
+
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    clearInterval(heartbeat);
+    eventClients.delete(res);
+    store.off("files-changed", sendChange);
+  };
+  req.on("close", close);
+  res.on("close", close);
+}
+
+function writeSse(res, event, payload) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
 function parseRange(header, size) {
@@ -668,10 +814,10 @@ function sendJson(res, status, payload) {
 
 function corsHeaders() {
   return {
-    "Access-Control-Allow-Headers": "Content-Type, Range",
-    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Range, X-WaterDrop-File-Name, X-WaterDrop-Mime-Type",
+    "Access-Control-Allow-Methods": "GET, HEAD, POST, DELETE, OPTIONS",
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Expose-Headers": "Content-Disposition, Content-Length, Content-Range, X-WaterDrop-SHA256",
+    "Access-Control-Expose-Headers": "Accept-Ranges, Content-Disposition, Content-Length, Content-Range, ETag, Last-Modified, X-WaterDrop-SHA256",
   };
 }
 
@@ -723,6 +869,25 @@ function asciiFileName(name) {
 
 function encodeRFC5987(value) {
   return encodeURIComponent(value).replace(/['()*]/g, (char) => `%${char.charCodeAt(0).toString(16)}`);
+}
+
+function decodeHeaderValue(value) {
+  const raw = cleanHeaderValue(value);
+  if (!raw) return "";
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function cleanHeaderValue(value) {
+  if (Array.isArray(value)) value = value[0];
+  return String(value || "").replace(/[\r\n]/g, "").trim();
+}
+
+function cleanMimeType(value) {
+  return cleanHeaderValue(value).split(";")[0].trim();
 }
 
 async function uniqueDestination(directory, fileName) {
