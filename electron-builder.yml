@@ -5,6 +5,7 @@ directories:
 files:
   - src/**/*
   - dist/renderer/**/*
+  - assets/**/*
   - package.json
 extraMetadata:
   main: src/main/main.js

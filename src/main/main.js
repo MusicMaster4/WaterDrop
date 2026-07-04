@@ -2,6 +2,7 @@
 
 const { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, nativeImage, shell } = require("electron");
 const path = require("path");
+const fs = require("fs");
 const { createDropServer } = require("../server/dropServer");
 const tailscale = require("./tailscale");
 const { initUpdater } = require("./updater");
@@ -11,6 +12,24 @@ let dropServer = null;
 let tray = null;
 let isQuitting = false;
 let dragIconImage = null;
+let appIconImage = null;
+
+// Write startup problems somewhere we can read them from an installed build,
+// where there is no console. Failing to log must never itself crash the app.
+function logDiagnostic(context, err) {
+  const line = `[${new Date().toISOString()}] ${context}: ${err && err.stack ? err.stack : err}\n`;
+  console.error(line);
+  try {
+    fs.appendFileSync(path.join(app.getPath("userData"), "waterdrop-main.log"), line);
+  } catch {
+    /* logging is best-effort */
+  }
+}
+
+// A crash in the main process during startup leaves the app as an invisible,
+// stuck process (no window, ghost tray). Surface it instead of dying silently.
+process.on("uncaughtException", (err) => logDiagnostic("uncaughtException", err));
+process.on("unhandledRejection", (err) => logDiagnostic("unhandledRejection", err));
 
 const FALLBACK_DRAG_ICON =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAAsTAAALEwEAmpwYAAACaElEQVRYhcWXwUtUQRzH30XTkpDV3e2mHt33XC2yOkuyBFqQLhtdxTLpT0itQ9GlcFGUMm0LWZKlS6EEpXSpEIMOWpDVSVcDT2bNzO9h/GKGZllXV98b560D38t7b37fz/x+w+P3M4ycBQB1hEKcUHuBUPhNmY37EY/xP1Y/AFhGvoWIhwiDIULh735Nd4HZJAwGEbF4J/MZr4y3gTCY3gJBGAwXyjwLYiC75p6lfbdyAIBp8AunGuThyCiOPBpTB6Fw3yDU/qyyee7jJ/T5KrG83Iezs3OKWbDneQY23G5c/bmGtbUmlpQcFgqFLPFMoQy/DBXyi23RjLlUezSmlAVDpe655lKjYwlvAb4ufsdAIJgXgL9b/PbDGwBCAZubI3nNpSKRc+Jb7QDJ5LM9zaUmJlJ6Af4QhqZZ5xggHK53nAXDyUcvXk46NpeanHqlD6Cz86prgK6ubn0AlhV2DcDLoA2gosLvGoDv0Qbg9wdcA/B/gjaAk42nRdCG4ycwGr3kCKDx1Bl9ADd6+kTQx4knOL/wBVtaz+8J0Nt3Sx/A0nJalCEWuywApmfeYlVVTV7zYPAYpldW9QFQZou/W1nZUUwkngqId+8/4LXu6xiub9hiXlp6BFOp545iugKQENXVNTg0/EBASDU1nc2c3I25AOBNgZsNy+kV7Om9iR0dV/D2nbs4Pp7EltYLouZO0y5FKKwrt2Q6JFuy/oMCoBTu8bbc4i1y4U8Pm4yxkBxMBg8AIJ49mhUTBm8KZs7gNSIW5c6HHGLAy3KI4ZRCfJt5znhu8omF31CVmWEH0w0ei1+4TM2z1j96Zhr0dLxoBwAAAABJRU5ErkJggg==";
@@ -29,21 +48,42 @@ function rendererDir() {
   return path.join(appRoot(), "dist", "renderer");
 }
 
-function iconPath() {
-  return path.join(appRoot(), "assets", "icon.ico");
+// Candidate icon locations, in priority order. `dist/renderer/icon.ico` is
+// always bundled (Vite copies it from public/), so it works even if `assets/`
+// is ever missing from the package — no more crashing on a missing icon.
+function iconCandidates() {
+  return [
+    path.join(appRoot(), "assets", "icon.ico"),
+    path.join(rendererDir(), "icon.ico"),
+    path.join(__dirname, "..", "renderer", "public", "icon.ico"),
+  ];
+}
+
+// Always returns a usable, non-empty NativeImage (falls back to an embedded
+// image), so Tray/BrowserWindow creation can never fail on a bad icon path.
+function appIcon() {
+  if (appIconImage && !appIconImage.isEmpty()) return appIconImage;
+  for (const candidate of iconCandidates()) {
+    try {
+      if (!fs.existsSync(candidate)) continue;
+      const image = nativeImage.createFromPath(candidate);
+      if (!image.isEmpty()) {
+        appIconImage = image;
+        return appIconImage;
+      }
+    } catch (err) {
+      logDiagnostic(`icon load failed (${candidate})`, err);
+    }
+  }
+  appIconImage = nativeImage.createFromDataURL(FALLBACK_DRAG_ICON);
+  return appIconImage;
 }
 
 function dragIcon() {
   if (dragIconImage && !dragIconImage.isEmpty()) return dragIconImage;
-
-  const appIcon = nativeImage.createFromPath(iconPath());
-  if (!appIcon.isEmpty()) {
-    const resized = appIcon.resize({ width: 32, height: 32 });
-    dragIconImage = resized.isEmpty() ? appIcon : resized;
-    return dragIconImage;
-  }
-
-  dragIconImage = nativeImage.createFromDataURL(FALLBACK_DRAG_ICON);
+  const base = appIcon();
+  const resized = base.resize({ width: 32, height: 32 });
+  dragIconImage = resized.isEmpty() ? base : resized;
   return dragIconImage;
 }
 
@@ -75,7 +115,7 @@ async function createWindow() {
     backgroundColor: "#08080a",
     title: "Water Drop",
     show: !shouldStartHidden(),
-    icon: iconPath(),
+    icon: appIcon(),
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -108,7 +148,13 @@ function showMainWindow() {
 
 function createTray() {
   if (tray) return;
-  tray = new Tray(iconPath());
+  try {
+    tray = new Tray(appIcon());
+  } catch (err) {
+    // A tray failure must never prevent the app window from opening.
+    logDiagnostic("tray creation failed", err);
+    return;
+  }
   tray.setToolTip("Water Drop");
   tray.setContextMenu(
     Menu.buildFromTemplate([
@@ -229,22 +275,34 @@ function wireIpc() {
 
 if (gotLock) {
   app.whenReady().then(async () => {
-    if (process.platform === "win32") {
-      app.setAppUserModelId("dev.jubarte.waterdrop");
-    }
-    Menu.setApplicationMenu(null);
-    await startServer();
-    applyLoginSettings();
-    createTray();
-    wireIpc();
-    await createWindow();
-    initUpdater(mainWindow);
-
-    app.on("activate", async () => {
-      if (BrowserWindow.getAllWindows().length === 0) {
-        await createWindow();
+    try {
+      if (process.platform === "win32") {
+        app.setAppUserModelId("dev.jubarte.waterdrop");
       }
-    });
+      Menu.setApplicationMenu(null);
+      await startServer();
+      applyLoginSettings();
+      createTray();
+      wireIpc();
+      await createWindow();
+      initUpdater(mainWindow);
+
+      app.on("activate", async () => {
+        if (BrowserWindow.getAllWindows().length === 0) {
+          await createWindow();
+        }
+      });
+    } catch (err) {
+      logDiagnostic("startup failed", err);
+      dialog.showErrorBox(
+        "Water Drop could not start",
+        `${(err && err.message) || err}\n\nDetails were written to:\n${path.join(
+          app.getPath("userData"),
+          "waterdrop-main.log"
+        )}`
+      );
+      app.quit();
+    }
   });
 
   app.on("second-instance", (_event, commandLine) => {
