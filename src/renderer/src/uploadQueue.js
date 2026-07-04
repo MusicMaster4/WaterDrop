@@ -3,6 +3,7 @@ const DB_VERSION = 1;
 const STORE_NAME = "uploads";
 
 export const PAGE_UPLOAD_LOCK_MS = 45 * 1000;
+export const STALE_UPLOAD_LOCK_MS = 2 * PAGE_UPLOAD_LOCK_MS;
 export const UPLOAD_SYNC_TAG = "waterdrop-upload-queue";
 
 let dbPromise = null;
@@ -38,6 +39,24 @@ export async function listQueuedUploads() {
   const db = await openDb();
   return requestAsPromise(db.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).getAll())
     .then((items) => items.sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0)));
+}
+
+export async function recoverInterruptedUploads(message = "Upload interrupted") {
+  if (!isUploadQueueSupported()) return 0;
+  const records = await listQueuedUploads();
+  const now = Date.now();
+  let recovered = 0;
+
+  for (const record of records) {
+    if (record.status !== "uploading") continue;
+    const updatedAt = Number(record.updatedAt || record.createdAt || 0);
+    const lockedUntil = Number(record.lockedUntil || 0);
+    if (lockedUntil > now && now - updatedAt <= STALE_UPLOAD_LOCK_MS) continue;
+    await markQueuedUploadFailed(record.id, message);
+    recovered += 1;
+  }
+
+  return recovered;
 }
 
 export async function claimQueuedUpload(id) {
