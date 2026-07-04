@@ -1,5 +1,6 @@
 import {
   Archive,
+  ArrowUpCircle,
   Check,
   ChevronDown,
   Clock3,
@@ -72,6 +73,8 @@ export default function App() {
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [confirmClear, setConfirmClear] = useState(false);
   const [previewFile, setPreviewFile] = useState(null);
+  const [update, setUpdate] = useState(null);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
 
   const toast = useCallback((message, kind = "info", action) => {
     const id = crypto.randomUUID();
@@ -142,6 +145,44 @@ export default function App() {
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [busy, refreshFiles]);
+
+  useEffect(() => {
+    if (!isDesktop || !window.waterdrop?.update) return undefined;
+    let active = true;
+    window.waterdrop.update.status().then((status) => {
+      if (active) setUpdate(status);
+    });
+    const unsubscribe = window.waterdrop.update.onStatus((status) => {
+      if (!active) return;
+      setUpdate(status);
+      if (status?.state === "available" || status?.state === "downloaded") {
+        setUpdateDismissed(false);
+      }
+    });
+    return () => {
+      active = false;
+      unsubscribe?.();
+    };
+  }, [isDesktop]);
+
+  const checkForUpdate = useCallback(async () => {
+    if (!window.waterdrop?.update) return;
+    const status = await window.waterdrop.update.check({ silent: false });
+    setUpdate(status);
+    if (status?.state === "up-to-date") toast("You're on the latest version", "ok");
+    if (status?.state === "dev") toast("Updates run only in the installed app", "info");
+  }, [toast]);
+
+  const downloadUpdate = useCallback(async () => {
+    if (!window.waterdrop?.update) return;
+    const result = await window.waterdrop.update.download();
+    if (!result.ok) toast(result.message || "Download failed", "warn");
+  }, [toast]);
+
+  const installUpdate = useCallback(async () => {
+    if (!window.waterdrop?.update) return;
+    await window.waterdrop.update.install();
+  }, []);
 
   const network = info?.network || appInfo?.network || {};
   const preferredUrl = network.preferredUrl || network.localUrl || appInfo?.server?.localUrl || "";
@@ -428,6 +469,18 @@ export default function App() {
                   onChange={(event) => updateSetting({ minimizeToTray: event.target.checked })}
                 />
               </label>
+              <div className="update-row">
+                <span className="mono small muted">
+                  v{update?.currentVersion || appInfo?.version || "?"}
+                  {update?.state === "downloading" && ` · downloading ${update.percent || 0}%`}
+                  {update?.state === "available" && ` · v${update.version} ready to download`}
+                  {update?.state === "downloaded" && ` · v${update.version} ready to install`}
+                  {update?.state === "checking" && " · checking…"}
+                </span>
+                <button className="btn btn-ghost btn-xs" onClick={checkForUpdate}>
+                  <RefreshCw size={13} /> Check updates
+                </button>
+              </div>
             </div>
           )}
 
@@ -559,6 +612,16 @@ export default function App() {
         />
       )}
 
+      {isDesktop && (
+        <UpdateBanner
+          update={update}
+          dismissed={updateDismissed}
+          onDownload={downloadUpdate}
+          onInstall={installUpdate}
+          onDismiss={() => setUpdateDismissed(true)}
+        />
+      )}
+
       <div className="toasts">
         {toasts.map((item) => (
           <div className="toast" key={item.id}>
@@ -573,6 +636,60 @@ export default function App() {
         ))}
       </div>
     </>
+  );
+}
+
+function UpdateBanner({ update, dismissed, onDownload, onInstall, onDismiss }) {
+  if (!update || dismissed) return null;
+  const { state } = update;
+  if (state !== "available" && state !== "downloading" && state !== "downloaded") return null;
+
+  return (
+    <div className="update-banner" role="status">
+      <span className="update-banner-mark" aria-hidden="true">
+        <ArrowUpCircle size={20} strokeWidth={1.7} />
+      </span>
+      <div className="update-banner-body">
+        {state === "available" && (
+          <>
+            <span className="update-banner-title">Version {update.version} is available</span>
+            <span className="update-banner-sub mono small">Your files and settings are kept.</span>
+          </>
+        )}
+        {state === "downloading" && (
+          <>
+            <span className="update-banner-title">Downloading v{update.version || ""}…</span>
+            <span className="update-banner-bar">
+              <span className="update-banner-fill" style={{ width: `${update.percent || 0}%` }} />
+            </span>
+          </>
+        )}
+        {state === "downloaded" && (
+          <>
+            <span className="update-banner-title">Version {update.version} is ready</span>
+            <span className="update-banner-sub mono small">Restart to finish installing.</span>
+          </>
+        )}
+      </div>
+      <div className="update-banner-actions">
+        {state === "available" && (
+          <button className="btn btn-solid btn-sm" onClick={onDownload}>
+            <Download size={14} /> Download
+          </button>
+        )}
+        {state === "downloading" && (
+          <span className="mono small muted">{update.percent || 0}%</span>
+        )}
+        {state === "downloaded" && (
+          <button className="btn btn-solid btn-sm" onClick={onInstall}>
+            <RefreshCw size={14} /> Install &amp; Restart
+          </button>
+        )}
+        <button className="icon-btn" title="Dismiss" onClick={onDismiss}>
+          <X size={16} />
+        </button>
+      </div>
+    </div>
   );
 }
 

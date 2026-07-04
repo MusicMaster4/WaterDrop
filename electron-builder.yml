@@ -12,7 +12,15 @@ win:
   target:
     - nsis
   icon: assets/icon.ico
+  artifactName: Water-Drop-${version}-Setup.${ext}
 nsis:
   oneClick: false
   perMachine: false
   allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false
+# Auto-update source: electron-updater reads latest.yml from GitHub Releases.
+publish:
+  - provider: github
+    owner: MusicMaster4
+    repo: WaterDrop
+    releaseType: release

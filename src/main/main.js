@@ -4,6 +4,7 @@ const { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, nativeImage,
 const path = require("path");
 const { createDropServer } = require("../server/dropServer");
 const tailscale = require("./tailscale");
+const { initUpdater } = require("./updater");
 
 let mainWindow = null;
 let dropServer = null;
@@ -237,6 +238,7 @@ if (gotLock) {
     createTray();
     wireIpc();
     await createWindow();
+    initUpdater(mainWindow);
 
     app.on("activate", async () => {
       if (BrowserWindow.getAllWindows().length === 0) {

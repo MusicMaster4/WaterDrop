@@ -1,0 +1,23 @@
+<svg width="200" height="200" viewBox="0 0 200 200" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Water Drop logo">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="38%" r="75%">
+      <stop offset="0%" stop-color="#16161a"/>
+      <stop offset="100%" stop-color="#08080a"/>
+    </radialGradient>
+    <linearGradient id="drop" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f7f8fa"/>
+      <stop offset="100%" stop-color="#aeb2b8"/>
+    </linearGradient>
+  </defs>
+  <rect x="1" y="1" width="198" height="198" rx="44" fill="url(#bg)" stroke="rgba(247,248,250,0.14)" stroke-width="1.5"/>
+  <!-- droplet -->
+  <path d="M100 40 C100 40 148 96 148 128 A48 48 0 0 1 52 128 C52 96 100 40 100 40 Z"
+        fill="url(#drop)" stroke="rgba(0,0,0,0.15)" stroke-width="1"/>
+  <!-- highlight -->
+  <path d="M84 118 a16 22 0 0 0 6 34" fill="none" stroke="rgba(255,255,255,0.75)" stroke-width="6" stroke-linecap="round" opacity="0.55"/>
+  <!-- shelf lines inside droplet -->
+  <g stroke="rgba(8,8,10,0.28)" stroke-width="4" stroke-linecap="round">
+    <line x1="80" y1="132" x2="120" y2="132"/>
+    <line x1="76" y1="146" x2="124" y2="146"/>
+  </g>
+</svg>

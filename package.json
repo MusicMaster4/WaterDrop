@@ -15,11 +15,16 @@
     "test": "node --test"
   },
   "keywords": [],
-  "author": "",
-  "license": "MIT",
+  "author": "Jubarte",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MusicMaster4/WaterDrop.git"
+  },
   "type": "commonjs",
   "dependencies": {
     "busboy": "^1.6.0",
+    "electron-updater": "^6.8.9",
     "lucide-react": "^1.23.0",
     "mime-types": "^3.0.2",
     "qrcode": "^1.5.4",

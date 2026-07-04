@@ -1,0 +1,58 @@
+<svg width="1200" height="380" viewBox="0 0 1200 380" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Water Drop">
+  <defs>
+    <radialGradient id="bbg" cx="26%" cy="30%" r="90%">
+      <stop offset="0%" stop-color="#141418"/>
+      <stop offset="100%" stop-color="#08080a"/>
+    </radialGradient>
+    <linearGradient id="bdrop" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f7f8fa"/>
+      <stop offset="100%" stop-color="#9ea2a8"/>
+    </linearGradient>
+    <linearGradient id="ink" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#f7f8fa"/>
+      <stop offset="100%" stop-color="#c9ccd1"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="380" rx="0" fill="url(#bbg)"/>
+  <!-- subtle grid -->
+  <g stroke="rgba(247,248,250,0.04)" stroke-width="1">
+    <line x1="0" y1="95" x2="1200" y2="95"/>
+    <line x1="0" y1="190" x2="1200" y2="190"/>
+    <line x1="0" y1="285" x2="1200" y2="285"/>
+  </g>
+
+  <!-- droplet mark -->
+  <g transform="translate(150,190)">
+    <circle r="118" fill="rgba(247,248,250,0.02)" stroke="rgba(247,248,250,0.10)" stroke-width="1.5"/>
+    <path d="M0 -74 C0 -74 62 -2 62 40 A62 62 0 0 1 -62 40 C-62 -2 0 -74 0 -74 Z"
+          fill="url(#bdrop)"/>
+    <path d="M-24 24 a20 28 0 0 0 8 44" fill="none" stroke="rgba(255,255,255,0.7)" stroke-width="7" stroke-linecap="round" opacity="0.5"/>
+    <g stroke="rgba(8,8,10,0.28)" stroke-width="5" stroke-linecap="round">
+      <line x1="-26" y1="30" x2="26" y2="30"/>
+      <line x1="-32" y1="48" x2="32" y2="48"/>
+    </g>
+  </g>
+
+  <!-- wordmark -->
+  <text x="320" y="170" font-family="Arial Black, Segoe UI, sans-serif" font-size="82" font-weight="900" fill="url(#ink)" letter-spacing="-2">WATER DROP</text>
+  <text x="324" y="216" font-family="Consolas, monospace" font-size="23" fill="#878b91" letter-spacing="1">AirDrop-style file sharing over your private Tailscale network</text>
+
+  <!-- chips -->
+  <g font-family="Consolas, monospace" font-size="18" fill="#d7dade">
+    <g transform="translate(324,250)">
+      <rect width="150" height="40" rx="20" fill="rgba(247,248,250,0.04)" stroke="rgba(247,248,250,0.14)"/>
+      <circle cx="24" cy="20" r="4" fill="#8fb89a"/>
+      <text x="40" y="26">Windows</text>
+    </g>
+    <g transform="translate(486,250)">
+      <rect width="196" height="40" rx="20" fill="rgba(247,248,250,0.04)" stroke="rgba(247,248,250,0.14)"/>
+      <circle cx="24" cy="20" r="4" fill="#8fb89a"/>
+      <text x="40" y="26">Auto-updating</text>
+    </g>
+    <g transform="translate(694,250)">
+      <rect width="170" height="40" rx="20" fill="rgba(247,248,250,0.04)" stroke="rgba(247,248,250,0.14)"/>
+      <circle cx="24" cy="20" r="4" fill="#8fb89a"/>
+      <text x="40" y="26">No cloud</text>
+    </g>
+  </g>
+</svg>
