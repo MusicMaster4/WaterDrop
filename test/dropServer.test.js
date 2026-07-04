@@ -292,6 +292,113 @@ test("bulk upload folders group files, rename, download as zip, and delete child
   }
 });
 
+test("assembles a parallel chunked upload into byte-identical bytes", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-chunk-test-"));
+  const rendererDir = path.join(root, "renderer");
+  const dataDir = path.join(root, "data");
+  const downloads = path.join(root, "downloads");
+  await fs.mkdir(rendererDir, { recursive: true });
+  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>WaterDrop</title>");
+
+  const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 47960 });
+  try {
+    const base = server.localUrl;
+    const payload = crypto.randomBytes(200000);
+    const expectedHash = sha256(payload);
+    const id = "33333333-3333-4333-8333-333333333333";
+    const chunkSize = 16384;
+
+    const offsets = [];
+    for (let start = 0; start < payload.length; start += chunkSize) offsets.push(start);
+
+    const sendChunk = (start) => {
+      const end = Math.min(payload.length, start + chunkSize);
+      return fetch(new URL("api/files/raw", base), {
+        method: "POST",
+        body: payload.subarray(start, end),
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "X-WaterDrop-File-Name": encodeURIComponent("blob.bin"),
+          "X-WaterDrop-Mime-Type": "application/octet-stream",
+          "X-WaterDrop-Upload-Id": id,
+          "X-WaterDrop-Chunk-Offset": String(start),
+          "X-WaterDrop-Total-Size": String(payload.length),
+        },
+      });
+    };
+
+    // Upload out of order and concurrently, exactly like the parallel client.
+    const responses = await Promise.all([...offsets].reverse().map(sendChunk));
+    // A retried chunk after completion must resolve as a duplicate, not corrupt.
+    const retry = await (await sendChunk(offsets[0])).json();
+    assert.equal(retry.duplicate, true);
+
+    const finals = [];
+    for (const res of responses) {
+      const body = await res.json();
+      if (res.status === 201 && body.files) finals.push(body.files[0]);
+    }
+    assert.equal(finals.length, 1);
+    assert.equal(finals[0].id, id);
+    assert.equal(finals[0].size, payload.length);
+    assert.equal(finals[0].sha256, expectedHash);
+
+    const download = await fetch(new URL(`api/files/${id}/download`, base));
+    const bytes = Buffer.from(await download.arrayBuffer());
+    assert.equal(bytes.length, payload.length);
+    assert.equal(sha256(bytes), expectedHash);
+    assert.equal(bytes.equals(payload), true);
+  } finally {
+    await server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("no-count range requests keep an accelerated download as one download", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-nocount-test-"));
+  const rendererDir = path.join(root, "renderer");
+  const dataDir = path.join(root, "data");
+  const downloads = path.join(root, "downloads");
+  await fs.mkdir(rendererDir, { recursive: true });
+  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>WaterDrop</title>");
+
+  const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 47970 });
+  try {
+    const base = server.localUrl;
+    const id = "44444444-4444-4444-8444-444444444444";
+    const upload = await fetch(new URL("api/files/raw", base), {
+      method: "POST",
+      body: new Blob(["hello-range"]),
+      headers: {
+        "Content-Type": "text/plain",
+        "X-WaterDrop-File-Name": encodeURIComponent("r.txt"),
+        "X-WaterDrop-Mime-Type": "text/plain",
+        "X-WaterDrop-Upload-Id": id,
+      },
+    });
+    assert.equal(upload.status, 201);
+
+    // Suppressed range parts (every part but the first of an accelerated download).
+    const suppressed = await fetch(new URL(`api/files/${id}/download`, base), {
+      headers: { Range: "bytes=0-1", "X-WaterDrop-No-Count": "1" },
+    });
+    assert.equal(suppressed.status, 206);
+    // The one counted part.
+    const counted = await fetch(new URL(`api/files/${id}/download`, base), {
+      headers: { Range: "bytes=2-3" },
+    });
+    assert.equal(counted.status, 206);
+
+    await waitForDownloads(base, id, 1);
+    const listed = await (await fetch(new URL("api/files", base))).json();
+    const file = listed.files.find((entry) => entry.id === id);
+    assert.equal(file.downloads, 1);
+  } finally {
+    await server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 function sha256(buffer) {
   return crypto.createHash("sha256").update(buffer).digest("hex");
 }

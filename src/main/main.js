@@ -127,6 +127,42 @@ async function autoPublishServe() {
   }
 }
 
+let httpsRenewTimer = null;
+
+// Stand up the direct HTTPS listener with a Tailscale-issued cert so phones can
+// open several parallel connections straight to this process. Best-effort: if
+// the tailnet has no HTTPS certs, we quietly keep using Serve. `tailscale cert`
+// reuses a still-valid cert, so re-running it is cheap and doubles as renewal.
+async function autoEnableDirectHttps() {
+  try {
+    if (!dropServer?.startHttps) return;
+    const state = await tailscale.status();
+    if (!state.running || !state.loggedIn || !state.dnsName) return;
+    const certDir = path.join(app.getPath("userData"), "certs");
+    await fs.promises.mkdir(certDir, { recursive: true });
+    const certPath = path.join(certDir, `${state.dnsName}.crt`);
+    const keyPath = path.join(certDir, `${state.dnsName}.key`);
+    const result = await tailscale.provisionCert(state.dnsName, certPath, keyPath);
+    if (!result.ok) {
+      logDiagnostic("direct https cert unavailable", result.message);
+      return;
+    }
+    const [cert, key] = await Promise.all([
+      fs.promises.readFile(certPath),
+      fs.promises.readFile(keyPath),
+    ]);
+    await dropServer.startHttps({ cert, key });
+  } catch (err) {
+    logDiagnostic("direct https enable error", err);
+  }
+}
+
+function scheduleHttpsRenewal() {
+  if (httpsRenewTimer) return;
+  httpsRenewTimer = setInterval(() => autoEnableDirectHttps(), 12 * 60 * 60 * 1000);
+  httpsRenewTimer.unref?.();
+}
+
 async function createWindow() {
   const preload = path.join(__dirname, "preload.js");
   mainWindow = new BrowserWindow({
@@ -330,6 +366,8 @@ if (gotLock) {
       Menu.setApplicationMenu(null);
       await startServer();
       autoPublishServe(); // best-effort, non-blocking: makes the QR a real phone link
+      autoEnableDirectHttps(); // best-effort: direct HTTPS unlocks full-speed parallel transfers
+      scheduleHttpsRenewal();
       applyLoginSettings();
       createTray();
       wireIpc();

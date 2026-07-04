@@ -112,13 +112,16 @@ function findServeHandler(config, pathName = "/drop") {
   return null;
 }
 
-async function inspect(port) {
+async function inspect(port, { httpsPort } = {}) {
   const ts = await status();
   const serve = await serveStatus();
   const handler = serve.ok ? findServeHandler(serve.config, "/drop") : null;
   const serveUrl = ts.dnsName ? `https://${ts.dnsName}/drop/` : null;
   const directUrl = ts.tailnetIp ? `http://${ts.tailnetIp}:${port}/drop/` : null;
   const localUrl = `http://127.0.0.1:${port}/drop/`;
+  // Direct HTTPS to this process (own Tailscale cert). Fastest and still a secure
+  // context, so it's the preferred link whenever it's up.
+  const httpsDirectUrl = ts.dnsName && httpsPort ? `https://${ts.dnsName}:${httpsPort}/drop/` : null;
 
   return {
     ...ts,
@@ -128,10 +131,23 @@ async function inspect(port) {
     serveProxy: handler ? handler.proxy : null,
     serveUrl,
     directUrl,
+    httpsDirectUrl,
     localUrl,
-    preferredUrl: handler && serveUrl ? serveUrl : directUrl || localUrl,
+    preferredUrl: httpsDirectUrl || (handler && serveUrl ? serveUrl : directUrl || localUrl),
     serveCommand: `tailscale serve --bg --yes --set-path /drop http://127.0.0.1:${port}`,
   };
+}
+
+// Ask Tailscale to issue (and thereafter renew) a TLS cert for this node's
+// MagicDNS name, written to the given files. Needs HTTPS certs enabled on the
+// tailnet; best-effort — the caller falls back to Serve/local if it fails.
+async function provisionCert(dnsName, certPath, keyPath) {
+  if (!dnsName) return { ok: false, message: "No MagicDNS name" };
+  const result = await run(["cert", "--cert-file", certPath, "--key-file", keyPath, dnsName], 45000);
+  if (!result.ok) {
+    return { ok: false, message: result.message || "tailscale cert failed" };
+  }
+  return { ok: true, message: result.stdout.trim() || "cert ready" };
 }
 
 async function configureServe(port) {
@@ -147,6 +163,7 @@ module.exports = {
   configureServe,
   exePath,
   inspect,
+  provisionCert,
   run,
   serveStatus,
   status,

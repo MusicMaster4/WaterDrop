@@ -50,6 +50,12 @@ import {
   updateQueuedUploadProgress,
   uploadRecordToView,
 } from "./uploadQueue";
+import {
+  canParallelDownload,
+  canParallelUpload,
+  parallelDownload,
+  parallelUpload,
+} from "./transfer";
 
 const TAILSCALE_URL = "https://tailscale.com/download";
 const TAILSCALE_IOS_URL = "https://apps.apple.com/app/tailscale/id1470499037";
@@ -59,6 +65,9 @@ const TAILSCALE_ANDROID_URL = "https://play.google.com/store/apps/details?id=com
 const ONBOARDING_STEPS = ["Welcome", "This PC", "Phone", "Publish", "Finish"];
 const LAST_ONBOARD_STEP = ONBOARDING_STEPS.length - 1;
 const UPLOAD_STALL_MS = Math.max(90 * 1000, STALE_UPLOAD_LOCK_MS);
+// Drain several queued files at once instead of strictly one-at-a-time; large
+// files also fan out internally into parallel chunks.
+const MAX_CONCURRENT_UPLOADS = 3;
 
 const apiDefault = {
   getInfo: () => request("api/info"),
@@ -221,22 +230,33 @@ export default function App() {
     try {
       await recoverInterruptedUploads("Upload interrupted by app suspend");
       const records = await listQueuedUploads();
-      for (const record of records) {
-        const activeBackgroundFetch = await serviceWorkerRegistrationRef.current?.backgroundFetch
-          ?.get(record.id)
-          .catch(() => null);
-        if (activeBackgroundFetch) continue;
-        const claimed = await claimQueuedUpload(record.id);
-        if (!claimed) continue;
-        await uploadQueuedRecord({
-          api,
-          record: claimed,
-          notifyUploadPaused,
-          refreshFiles,
-          registerBackgroundUpload,
-          setUploads,
-        });
-      }
+      // Drain several files at once from a shared queue; claimQueuedUpload keeps
+      // any one record from being picked up twice.
+      const queue = [...records];
+      const runNext = async () => {
+        while (queue.length) {
+          const record = queue.shift();
+          const activeBackgroundFetch = await serviceWorkerRegistrationRef.current?.backgroundFetch
+            ?.get(record.id)
+            .catch(() => null);
+          if (activeBackgroundFetch) continue;
+          const claimed = await claimQueuedUpload(record.id);
+          if (!claimed) continue;
+          await uploadQueuedRecord({
+            api,
+            record: claimed,
+            notifyUploadPaused,
+            refreshFiles,
+            registerBackgroundUpload,
+            setUploads,
+          });
+        }
+      };
+      const pool = Array.from(
+        { length: Math.min(MAX_CONCURRENT_UPLOADS, queue.length) },
+        () => runNext()
+      );
+      await Promise.all(pool);
     } finally {
       drainingUploadsRef.current = false;
       await refreshQueuedUploads();
@@ -667,8 +687,47 @@ export default function App() {
       notify(result.message || "Save failed", "warn");
       return;
     }
-    window.location.href = api.downloadUrl(file.id);
-    window.setTimeout(refreshFiles, 1000);
+    await browserDownload(file);
+  }
+
+  function shouldAccelerateDownload(file) {
+    return !isFolderEntry(file) && canParallelDownload(file);
+  }
+
+  // Accelerated multi-connection download with a plain native download as the
+  // fallback for folders, small files, unsupported browsers, or any error.
+  async function browserDownload(file) {
+    if (shouldAccelerateDownload(file)) {
+      let lastPct = -100;
+      try {
+        notify(`Downloading ${file.name}…`, "info");
+        await parallelDownload(file, api.downloadUrl(file.id), {
+          onProgress: (pct) => {
+            if (pct - lastPct >= 10) {
+              lastPct = pct;
+              notify(`Downloading ${file.name} — ${pct}%`, "info");
+            }
+          },
+        });
+        notify("Download complete", "ok");
+        window.setTimeout(() => refreshFiles({ silent: true }), 500);
+        return;
+      } catch {
+        // Fall through to the native download below.
+      }
+    }
+    nativeDownload(file);
+  }
+
+  function nativeDownload(file) {
+    const anchor = document.createElement("a");
+    anchor.href = api.downloadUrl(file.id);
+    anchor.download = file.name || "download";
+    anchor.rel = "noopener";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => refreshFiles({ silent: true }), 1000);
   }
 
   async function renameFolder(file) {
@@ -1465,7 +1524,18 @@ function FileCard({
             <HardDriveDownload size={14} /> Save
           </button>
         ) : (
-          <a className="btn btn-solid btn-xs" href={api.downloadUrl(file.id)} download>
+          <a
+            className="btn btn-solid btn-xs"
+            href={api.downloadUrl(file.id)}
+            download
+            onClick={(event) => {
+              // Let the native download run for folders/small files; otherwise
+              // take over with the accelerated multi-connection download.
+              if (isFolder || !canParallelDownload(file)) return;
+              event.preventDefault();
+              onDownload();
+            }}
+          >
             <Download size={14} /> Get
           </a>
         )}
@@ -1734,12 +1804,15 @@ async function uploadQueuedRecord({
 
   try {
     await new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
       let settled = false;
       let lastActivityAt = Date.now();
+      let activeXhr = null;
+      let activeController = null;
+      let heartbeat = null;
 
       const cleanup = () => {
         window.clearInterval(stallTimer);
+        if (heartbeat) window.clearInterval(heartbeat);
         window.removeEventListener("offline", onOffline);
         window.removeEventListener("pagehide", onPageHide);
         document.removeEventListener("visibilitychange", onVisibilityChange);
@@ -1753,12 +1826,22 @@ async function uploadQueuedRecord({
       const fail = (message) => {
         if (settled) return;
         try {
-          xhr.abort();
+          activeXhr?.abort();
+        } catch {}
+        try {
+          activeController?.abort();
         } catch {}
         settle(reject, new Error(message));
       };
       const markActivity = () => {
         lastActivityAt = Date.now();
+      };
+      const applyProgress = (progress) => {
+        setUploads((items) => upsertUpload(items, { ...view, status: "uploading", progress }));
+        if (progress - lastPersistedProgress >= 10 || progress === 100) {
+          lastPersistedProgress = progress;
+          updateQueuedUploadProgress(record.id, progress).catch(() => {});
+        }
       };
       const onOffline = () => fail("Upload paused while offline");
       const onPageHide = () => fail("Upload paused while app was backgrounded");
@@ -1775,33 +1858,58 @@ async function uploadQueuedRecord({
       window.addEventListener("pagehide", onPageHide);
       document.addEventListener("visibilitychange", onVisibilityChange);
 
-      xhr.open("POST", uploadUrl, true);
-      xhr.setRequestHeader("Content-Type", record.mimeType || "application/octet-stream");
-      xhr.setRequestHeader("X-WaterDrop-File-Name", encodeURIComponent(record.name || "unnamed-file"));
-      xhr.setRequestHeader("X-WaterDrop-Mime-Type", record.mimeType || "application/octet-stream");
-      xhr.setRequestHeader("X-WaterDrop-Upload-Id", record.id);
-      if (record.folderId) xhr.setRequestHeader("X-WaterDrop-Folder-Id", record.folderId);
-      xhr.upload.onprogress = (event) => {
+      if (canParallelUpload(record)) {
+        // Large file: fan out into parallel byte-range chunks. Server reassembles
+        // and hashes them, so the stored bytes are identical to the source.
+        const controller = new AbortController();
+        activeController = controller;
         markActivity();
-        if (!event.lengthComputable) return;
-        const progress = Math.round((event.loaded / event.total) * 100);
-        setUploads((items) => upsertUpload(items, { ...view, status: "uploading", progress }));
-        if (progress - lastPersistedProgress >= 10 || progress === 100) {
-          lastPersistedProgress = progress;
-          updateQueuedUploadProgress(record.id, progress).catch(() => {});
-        }
-      };
-      xhr.upload.onload = markActivity;
-      xhr.onload = () => {
-        if (xhr.status >= 200 && xhr.status < 300) {
-          settle(resolve);
-          return;
-        }
-        settle(reject, new Error(`HTTP ${xhr.status}`));
-      };
-      xhr.onerror = () => settle(reject, new Error("Network error"));
-      xhr.onabort = () => settle(reject, new Error("Upload aborted"));
-      xhr.send(record.blob);
+        // fetch can't report sub-chunk upload progress, and a single 8 MB chunk
+        // split across parallel connections can take well over the stall window
+        // on a slow link. Keep the connection considered "alive" on a heartbeat;
+        // real drops are still caught by offline/pagehide/visibility and by the
+        // fetch itself rejecting.
+        heartbeat = window.setInterval(markActivity, 15000);
+        parallelUpload({
+          blob: record.blob,
+          uploadUrl,
+          id: record.id,
+          name: record.name,
+          mimeType: record.mimeType,
+          folderId: record.folderId,
+          signal: controller.signal,
+          onProgress: applyProgress,
+          onActivity: markActivity,
+        })
+          .then(() => settle(resolve))
+          .catch((err) => settle(reject, err instanceof Error ? err : new Error(String(err))));
+      } else {
+        // Small file: a single streamed request is already optimal.
+        const xhr = new XMLHttpRequest();
+        activeXhr = xhr;
+        xhr.open("POST", uploadUrl, true);
+        xhr.setRequestHeader("Content-Type", record.mimeType || "application/octet-stream");
+        xhr.setRequestHeader("X-WaterDrop-File-Name", encodeURIComponent(record.name || "unnamed-file"));
+        xhr.setRequestHeader("X-WaterDrop-Mime-Type", record.mimeType || "application/octet-stream");
+        xhr.setRequestHeader("X-WaterDrop-Upload-Id", record.id);
+        if (record.folderId) xhr.setRequestHeader("X-WaterDrop-Folder-Id", record.folderId);
+        xhr.upload.onprogress = (event) => {
+          markActivity();
+          if (!event.lengthComputable) return;
+          applyProgress(Math.round((event.loaded / event.total) * 100));
+        };
+        xhr.upload.onload = markActivity;
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            settle(resolve);
+            return;
+          }
+          settle(reject, new Error(`HTTP ${xhr.status}`));
+        };
+        xhr.onerror = () => settle(reject, new Error("Network error"));
+        xhr.onabort = () => settle(reject, new Error("Upload aborted"));
+        xhr.send(record.blob);
+      }
     });
 
     await clearQueuedUpload(record.id);

@@ -6,6 +6,7 @@ const crypto = require("crypto");
 const EventEmitter = require("events");
 const fs = require("fs");
 const http = require("http");
+const https = require("https");
 const mime = require("mime-types");
 const path = require("path");
 const { Transform, pipeline } = require("stream");
@@ -16,8 +17,13 @@ const streamPipeline = promisify(pipeline);
 const fsp = fs.promises;
 const BASE_PATH = "/drop";
 const DEFAULT_PORT = 41737;
+// A second, direct HTTPS listener (HTTP/1.1) served with a Tailscale-issued cert.
+// It lets phones open several parallel connections straight to this process for
+// full-speed transfers, skipping the Tailscale Serve proxy, while staying a
+// secure context. TLS uses AES-NI, so it's cheap — and Serve already did TLS.
+const DEFAULT_HTTPS_PORT = 41843;
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
-const UPLOAD_HIGH_WATER_MARK = 1024 * 1024;
+const UPLOAD_HIGH_WATER_MARK = 4 * 1024 * 1024;
 const DOWNLOAD_HIGH_WATER_MARK = 8 * 1024 * 1024;
 const SSE_HEARTBEAT_MS = 25 * 1000;
 const DOWNLOAD_RECORD_DELAY_MS = 25;
@@ -25,6 +31,9 @@ const DOWNLOAD_METADATA_DEBOUNCE_MS = 1000;
 // Backstop so a dropped connection mid-upload can't leave a shimmer placeholder
 // stuck on every device forever.
 const PENDING_UPLOAD_TIMEOUT_MS = 60 * 60 * 1000;
+// A stalled chunked-upload assembly (some chunks never arrive) is torn down after
+// this long so its temp file and placeholder don't linger.
+const UPLOAD_SESSION_TIMEOUT_MS = 60 * 60 * 1000;
 
 class FileStore extends EventEmitter {
   constructor({ dataDir, defaultDownloadDir }) {
@@ -42,6 +51,10 @@ class FileStore extends EventEmitter {
     // In-flight uploads, keyed by the id the finished file will receive, so every
     // connected device can show a live "loading" placeholder while bytes arrive.
     this.pendingUploads = new Map();
+    // In-flight chunked uploads (parallel multi-connection transfers), keyed by
+    // the same id. Each session assembles positioned chunk writes into one temp
+    // file, then hashes + commits it exactly like a single-shot upload.
+    this.uploadSessions = new Map();
     this.files = [];
     this.settings = {
       downloadDir: defaultDownloadDir,
@@ -225,6 +238,97 @@ class FileStore extends EventEmitter {
     return toPublicFile(entry, this);
   }
 
+  // --- Chunked (parallel) upload assembly ---------------------------------
+  // A large file is uploaded as many chunks over separate connections at once.
+  // Each chunk is written straight to its byte offset in a preallocated temp
+  // file, so the reassembled bytes are identical to the original — the finished
+  // file is hashed and committed through the very same addFromTemp path.
+
+  getOrCreateUploadSession({ id, name, totalSize, mimeType, folderId }) {
+    let session = this.uploadSessions.get(id);
+    if (session) return session;
+    const tempPath = path.join(this.tmpDir, `${id}.chunked.upload`);
+    session = {
+      id,
+      name: safeDisplayName(name),
+      mimeType,
+      folderId: folderId || "",
+      totalSize,
+      tempPath,
+      received: new Map(), // offset -> bytes, so retried chunks aren't double-counted
+      receivedBytes: 0,
+      finalizing: false,
+      timer: null,
+      // Preallocate the file up front so every parallel chunk can open its own
+      // positioned write stream without racing to create it.
+      ready: (async () => {
+        const handle = await fsp.open(tempPath, "w");
+        try {
+          if (totalSize > 0) await handle.truncate(totalSize);
+        } finally {
+          await handle.close();
+        }
+      })(),
+    };
+    session.timer = setTimeout(() => {
+      this.abortUploadSession(id, "upload-timeout").catch(() => {});
+    }, UPLOAD_SESSION_TIMEOUT_MS);
+    session.timer.unref?.();
+    this.uploadSessions.set(id, session);
+    // Same shimmer placeholder a single-shot upload shows.
+    this.addPendingUpload({ id, name, size: totalSize });
+    return session;
+  }
+
+  async writeUploadChunk({ id, name, mimeType, folderId, totalSize, offset, length, req }) {
+    const session = this.getOrCreateUploadSession({ id, name, totalSize, mimeType, folderId });
+    await session.ready;
+    const written = await writeRequestAtOffset(session.tempPath, offset, req);
+    if (written !== length) {
+      throw new Error(`Chunk length mismatch (expected ${length}, wrote ${written})`);
+    }
+    if (!session.received.has(offset)) {
+      session.received.set(offset, written);
+      session.receivedBytes += written;
+    }
+    return session;
+  }
+
+  async finalizeUploadSession({ id, originalName, mimeType }) {
+    const session = this.uploadSessions.get(id);
+    if (!session) return null;
+    clearTimeout(session.timer);
+    this.uploadSessions.delete(id);
+    const sha256 = await hashFile(session.tempPath);
+    return this.addFromTemp({
+      id,
+      tempPath: session.tempPath,
+      originalName: originalName || session.name,
+      mimeType: mimeType || session.mimeType,
+      size: session.totalSize,
+      sha256,
+      folderId: session.folderId,
+    });
+  }
+
+  async abortUploadSession(id, reason = "upload-cancelled") {
+    const session = this.uploadSessions.get(id);
+    if (!session) return false;
+    clearTimeout(session.timer);
+    this.uploadSessions.delete(id);
+    try {
+      await session.ready;
+    } catch {}
+    await removeIfExists(session.tempPath);
+    this.removePendingUpload(id, reason);
+    return true;
+  }
+
+  async abortAllUploadSessions(reason = "shutdown") {
+    const ids = Array.from(this.uploadSessions.keys());
+    await Promise.allSettled(ids.map((id) => this.abortUploadSession(id, reason)));
+  }
+
   async recordDownload(id) {
     if (!this.applyDownloadRecord(id)) return;
     await this.saveFiles();
@@ -385,35 +489,84 @@ async function createDropServer({ dataDir, defaultDownloadDir, rendererDir, port
   await store.init();
   const eventClients = new Set();
 
-  const server = http.createServer((req, res) => {
-    handleRequest({ req, res, store, rendererDir, getPort: () => actualPort, eventClients }).catch((err) => {
+  let actualPort;
+  let actualHttpsPort = null;
+  let httpsServer = null;
+
+  const requestListener = (req, res) => {
+    handleRequest({
+      req,
+      res,
+      store,
+      rendererDir,
+      getPort: () => actualPort,
+      getHttpsPort: () => actualHttpsPort,
+      eventClients,
+    }).catch((err) => {
       if (err?.code === "UPLOAD_ABORTED") return;
       console.error(err);
       sendJson(res, 500, { error: "Internal server error" });
     });
-  });
+  };
 
-  let actualPort = await listenWithFallback(server, port);
+  const server = http.createServer(requestListener);
+
+  // Disable Nagle so the many small round-trips of parallel range/chunk transfers
+  // aren't delayed by TCP coalescing.
+  server.on("connection", (socket) => socket.setNoDelay(true));
+  // Big transfers can legitimately hold a single request open for a long time on
+  // a slow link; the client's own stall detection handles truly dead uploads.
+  server.requestTimeout = 0;
+
+  actualPort = await listenWithFallback(server, port);
   const cleanupTimer = setInterval(() => {
     store.cleanupExpired().catch((err) => console.error("Cleanup failed", err));
   }, 60 * 60 * 1000);
   cleanupTimer.unref();
+
+  // Bring up (or hot-swap the cert of) the direct HTTPS listener. Plain HTTP/1.1
+  // over TLS — deliberately not HTTP/2 — so browsers open several parallel
+  // connections and the chunked transfers actually run in parallel.
+  async function startHttps({ cert, key, preferredPort = DEFAULT_HTTPS_PORT }) {
+    if (!cert || !key) throw new Error("HTTPS needs a cert and key");
+    if (httpsServer) {
+      httpsServer.setSecureContext({ cert, key });
+      return actualHttpsPort;
+    }
+    const secure = https.createServer({ cert, key }, requestListener);
+    secure.on("secureConnection", (socket) => socket.setNoDelay(true));
+    secure.requestTimeout = 0;
+    actualHttpsPort = await listenWithFallback(secure, preferredPort);
+    httpsServer = secure;
+    return actualHttpsPort;
+  }
 
   return {
     port: actualPort,
     basePath: BASE_PATH,
     localUrl: `http://127.0.0.1:${actualPort}${BASE_PATH}/`,
     store,
+    startHttps,
+    getHttpsPort: () => actualHttpsPort,
     async close() {
       clearInterval(cleanupTimer);
       for (const client of eventClients) client.end();
-      await new Promise((resolve) => server.close(resolve));
+      await store.abortAllUploadSessions("shutdown");
+      const closers = [new Promise((resolve) => server.close(resolve))];
+      server.closeIdleConnections?.();
+      if (httpsServer) {
+        closers.push(new Promise((resolve) => httpsServer.close(resolve)));
+        httpsServer.closeIdleConnections?.();
+      }
+      // Don't wait out keep-alive timeouts on idle sockets; active transfers
+      // still get to finish.
+      await Promise.all(closers);
       await store.flushPendingDownloadRecords();
     },
   };
 }
 
-async function handleRequest({ req, res, store, rendererDir, getPort, eventClients }) {
+async function handleRequest({ req, res, store, rendererDir, getPort, getHttpsPort, eventClients }) {
   if (!isAllowedRemote(req.socket.remoteAddress)) {
     sendJson(res, 403, { error: "WaterDrop only accepts loopback or Tailscale clients." });
     return;
@@ -434,14 +587,14 @@ async function handleRequest({ req, res, store, rendererDir, getPort, eventClien
   }
 
   if (pathname.startsWith("/api/")) {
-    await handleApi({ req, res, url, relative: pathname, store, getPort, eventClients });
+    await handleApi({ req, res, url, relative: pathname, store, getPort, getHttpsPort, eventClients });
     return;
   }
 
   if (pathname.startsWith(`${BASE_PATH}/`)) {
     const relative = pathname.slice(BASE_PATH.length);
     if (relative.startsWith("/api/")) {
-      await handleApi({ req, res, url, relative, store, getPort, eventClients });
+      await handleApi({ req, res, url, relative, store, getPort, getHttpsPort, eventClients });
       return;
     }
     await serveStatic({ req, res, pathname: relative, rendererDir });
@@ -456,13 +609,13 @@ async function handleRequest({ req, res, store, rendererDir, getPort, eventClien
   sendJson(res, 404, { error: "Not found" });
 }
 
-async function handleApi({ req, res, relative, store, getPort, eventClients }) {
+async function handleApi({ req, res, relative, store, getPort, getHttpsPort, eventClients }) {
   if (relative.startsWith(BASE_PATH + "/api/")) {
     relative = relative.slice(BASE_PATH.length);
   }
 
   if (req.method === "GET" && relative === "/api/info") {
-    const network = await tailscale.inspect(getPort());
+    const network = await tailscale.inspect(getPort(), { httpsPort: getHttpsPort?.() });
     const qrSvg = await QRCode.toString(network.preferredUrl, {
       type: "svg",
       margin: 1,
@@ -570,6 +723,23 @@ async function handleRawUpload(req, res, store) {
     return;
   }
 
+  // Parallel multi-connection upload: each request carries one byte-range chunk.
+  // The whole-file path below stays the fallback for small files and clients that
+  // don't chunk.
+  const chunkOffsetHeader = cleanHeaderValue(req.headers["x-waterdrop-chunk-offset"]);
+  const totalSizeHeader = cleanHeaderValue(req.headers["x-waterdrop-total-size"]);
+  if (chunkOffsetHeader !== "" && totalSizeHeader !== "") {
+    await handleChunkUpload(req, res, store, {
+      id,
+      originalName,
+      mimeType,
+      folderId,
+      chunkOffsetHeader,
+      totalSizeHeader,
+    });
+    return;
+  }
+
   const tempPath = path.join(store.tmpDir, `${id}.${crypto.randomUUID()}.upload`);
   const hash = crypto.createHash("sha256");
   let size = 0;
@@ -616,6 +786,60 @@ async function handleRawUpload(req, res, store) {
       throw err;
     }
     sendJson(res, 500, { error: `Upload failed: ${err.message}` });
+  }
+}
+
+async function handleChunkUpload(req, res, store, { id, originalName, mimeType, folderId, chunkOffsetHeader, totalSizeHeader }) {
+  const offset = Number(chunkOffsetHeader);
+  const totalSize = Number(totalSizeHeader);
+  const length = Number(cleanHeaderValue(req.headers["content-length"]));
+  if (
+    !Number.isInteger(offset) || offset < 0 ||
+    !Number.isInteger(totalSize) || totalSize <= 0 ||
+    !Number.isInteger(length) || length <= 0 ||
+    offset + length > totalSize
+  ) {
+    req.resume();
+    sendJson(res, 400, { error: "Invalid upload chunk" });
+    return;
+  }
+
+  try {
+    const session = await store.writeUploadChunk({
+      id,
+      name: originalName,
+      mimeType,
+      folderId,
+      totalSize,
+      offset,
+      length,
+      req,
+    });
+
+    // The chunk whose write completes the file finalizes it. JS is single
+    // threaded, so exactly one chunk sees the byte count reach the total with
+    // finalizing still false.
+    if (session.receivedBytes >= session.totalSize && !session.finalizing) {
+      session.finalizing = true;
+      try {
+        const file = await store.finalizeUploadSession({ id, originalName, mimeType });
+        sendJson(res, 201, { files: [file] });
+      } catch (err) {
+        session.finalizing = false;
+        await store.abortUploadSession(id, "upload-failed");
+        sendJson(res, 500, { error: `Upload failed: ${err.message}` });
+      }
+      return;
+    }
+
+    sendJson(res, 200, { ok: true, received: session.receivedBytes, total: session.totalSize });
+  } catch (err) {
+    if (req.aborted) {
+      err.code = "UPLOAD_ABORTED";
+      throw err;
+    }
+    // One failed chunk doesn't kill the file — the client just retries it.
+    sendJson(res, 500, { error: `Chunk failed: ${err.message}` });
   }
 }
 
@@ -718,6 +942,10 @@ async function handleDownload(req, res, store, id) {
     await sendFolderZip({ req, res, store, folder: file });
     return;
   }
+  // An accelerated download issues many parallel range requests for one file;
+  // it tags every request but the first with X-WaterDrop-No-Count so the file
+  // still registers as a single logical download.
+  const noCount = cleanHeaderValue(req.headers["x-waterdrop-no-count"]);
   await sendStoredFile({
     req,
     res,
@@ -725,7 +953,7 @@ async function handleDownload(req, res, store, id) {
     id,
     disposition: "attachment",
     cacheControl: "private, max-age=0, no-transform",
-    recordDownload: true,
+    recordDownload: !noCount,
   });
 }
 
@@ -842,6 +1070,36 @@ function pipeFileToResponse(res, filePath, options) {
   });
   res.on("close", () => fileStream.destroy());
   fileStream.pipe(res);
+}
+
+// Stream one upload chunk straight to its byte offset in the (preallocated) temp
+// file. Each chunk uses an independent positioned write stream, so many can run
+// at once without disturbing each other's file position.
+function writeRequestAtOffset(tempPath, offset, req) {
+  let bytes = 0;
+  const counter = new Transform({
+    transform(chunk, _encoding, callback) {
+      bytes += chunk.length;
+      callback(null, chunk);
+    },
+  });
+  return streamPipeline(
+    req,
+    counter,
+    fs.createWriteStream(tempPath, { flags: "r+", start: offset, highWaterMark: UPLOAD_HIGH_WATER_MARK })
+  ).then(() => bytes);
+}
+
+// SHA-256 the reassembled file. Chunks arrive out of order, so the hash is taken
+// once at the end over the finished bytes — identical to hashing the original.
+function hashFile(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash("sha256");
+    const stream = fs.createReadStream(filePath, { highWaterMark: DOWNLOAD_HIGH_WATER_MARK });
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(hash.digest("hex")));
+  });
 }
 
 function recordDownloadAfterResponse(res, store, id) {
@@ -1205,7 +1463,7 @@ function sendJson(res, status, payload) {
 
 function corsHeaders() {
   return {
-    "Access-Control-Allow-Headers": "Content-Type, Range, X-WaterDrop-File-Name, X-WaterDrop-Mime-Type, X-WaterDrop-Upload-Id, X-WaterDrop-Folder-Id",
+    "Access-Control-Allow-Headers": "Content-Type, Range, X-WaterDrop-File-Name, X-WaterDrop-Mime-Type, X-WaterDrop-Upload-Id, X-WaterDrop-Folder-Id, X-WaterDrop-Chunk-Offset, X-WaterDrop-Total-Size, X-WaterDrop-No-Count",
     "Access-Control-Allow-Methods": "GET, HEAD, POST, PATCH, DELETE, OPTIONS",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Expose-Headers": "Accept-Ranges, Content-Disposition, Content-Length, Content-Range, ETag, Last-Modified, X-WaterDrop-SHA256",
