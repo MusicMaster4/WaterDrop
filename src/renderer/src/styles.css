@@ -1092,6 +1092,15 @@ body::before {
   width: 100%;
   margin-top: 10px;
 }
+.setup-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
 
 /* ============================================================
    ONBOARDING -- first-run setup guide

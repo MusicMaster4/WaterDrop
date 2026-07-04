@@ -563,9 +563,12 @@ export default function App() {
                 onDownload={downloadUpdate}
                 onInstall={installUpdate}
               />
-              <button className="btn btn-ghost btn-sm full-btn" onClick={rerunSetup}>
-                <RefreshCw size={13} /> Re-run setup
-              </button>
+              <div className="setup-row">
+                <span className="mono small muted">Setup guide</span>
+                <button className="btn btn-ghost btn-xs" onClick={rerunSetup}>
+                  <RefreshCw size={13} /> Re-run setup
+                </button>
+              </div>
             </div>
           )}
 
