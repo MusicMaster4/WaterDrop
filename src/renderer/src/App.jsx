@@ -80,6 +80,7 @@ export default function App() {
   const [appInfo, setAppInfo] = useState(null);
   const [info, setInfo] = useState(null);
   const [files, setFiles] = useState([]);
+  const [pending, setPending] = useState([]);
   const [settings, setSettings] = useState({});
   const [uploads, setUploads] = useState([]);
   const [dragging, setDragging] = useState(false);
@@ -110,6 +111,7 @@ export default function App() {
     try {
       const result = await api.getFiles();
       setFiles(result.files || []);
+      setPending(result.pending || []);
       setSettings(result.settings || {});
     } catch (err) {
       if (!silent) notify(err.message || "Could not refresh files", "warn");
@@ -236,6 +238,13 @@ export default function App() {
       nextExpiry: files.reduce((min, file) => Math.min(min, file.expiresAt || Infinity), Infinity),
     };
   }, [files]);
+
+  // Placeholders for uploads still in flight anywhere on the tailnet. Drop any
+  // whose real file has already landed so the swap has no flicker or duplicate.
+  const placeholders = useMemo(
+    () => pending.filter((item) => !files.some((file) => file.id === item.id)),
+    [pending, files]
+  );
 
   async function copyText(text, label = "Copied") {
     if (!text) return;
@@ -677,10 +686,14 @@ export default function App() {
           )}
 
           <section className="shelf">
-            {files.length === 0 ? (
+            {files.length === 0 && placeholders.length === 0 ? (
               <div className="empty">NO FILES ON THE SHELF</div>
             ) : (
-              files.map((file) => (
+              <>
+                {placeholders.map((item) => (
+                  <PlaceholderCard item={item} key={item.id} />
+                ))}
+                {files.map((file) => (
                 <FileCard
                   api={api}
                   confirmDelete={confirmDelete === file.id}
@@ -695,7 +708,8 @@ export default function App() {
                   onCancelDelete={() => setConfirmDelete(null)}
                   onStartDrag={(event) => startExternalDrag(file, event)}
                 />
-              ))
+                ))}
+              </>
             )}
           </section>
         </main>
@@ -999,6 +1013,32 @@ function UpdateInline({ update, onDownload, onInstall }) {
         </>
       )}
     </div>
+  );
+}
+
+function PlaceholderCard({ item }) {
+  const name = item.name || "Incoming file";
+  return (
+    <article className="file file-placeholder" aria-label={`Receiving ${name}`} aria-busy="true">
+      <div className="file-tile file-tile-loading shimmer">
+        <UploadCloud className="placeholder-icon" size={22} strokeWidth={1.5} aria-hidden="true" />
+      </div>
+      <div className="file-body">
+        <div className="file-name" title={name}>
+          {name}
+        </div>
+        <div className="file-meta mono small">
+          <span>{item.size ? formatBytes(item.size) : "Receiving…"}</span>
+          <span className="placeholder-status">
+            <UploadCloud size={12} /> uploading
+          </span>
+        </div>
+        <span className="placeholder-line shimmer" aria-hidden="true" />
+      </div>
+      <div className="file-actions">
+        <span className="placeholder-pill shimmer" aria-hidden="true" />
+      </div>
+    </article>
   );
 }
 

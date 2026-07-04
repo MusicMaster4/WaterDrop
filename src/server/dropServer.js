@@ -22,6 +22,9 @@ const DOWNLOAD_HIGH_WATER_MARK = 8 * 1024 * 1024;
 const SSE_HEARTBEAT_MS = 25 * 1000;
 const DOWNLOAD_RECORD_DELAY_MS = 25;
 const DOWNLOAD_METADATA_DEBOUNCE_MS = 1000;
+// Backstop so a dropped connection mid-upload can't leave a shimmer placeholder
+// stuck on every device forever.
+const PENDING_UPLOAD_TIMEOUT_MS = 60 * 60 * 1000;
 
 class FileStore extends EventEmitter {
   constructor({ dataDir, defaultDownloadDir }) {
@@ -36,6 +39,9 @@ class FileStore extends EventEmitter {
     this.filesSaveQueue = Promise.resolve();
     this.pendingDownloadRecords = new Set();
     this.pendingDownloadSaveTimer = null;
+    // In-flight uploads, keyed by the id the finished file will receive, so every
+    // connected device can show a live "loading" placeholder while bytes arrive.
+    this.pendingUploads = new Map();
     this.files = [];
     this.settings = {
       downloadDir: defaultDownloadDir,
@@ -88,6 +94,47 @@ class FileStore extends EventEmitter {
       .map((file) => toPublicFile(file));
   }
 
+  addPendingUpload({ id, name, size }) {
+    const entry = {
+      id,
+      name: safeDisplayName(name),
+      size: Number(size) > 0 ? Number(size) : 0,
+      createdAt: Date.now(),
+      timer: null,
+    };
+    entry.timer = setTimeout(() => this.removePendingUpload(id, "upload-timeout"), PENDING_UPLOAD_TIMEOUT_MS);
+    entry.timer.unref?.();
+    this.pendingUploads.set(id, entry);
+    this.notifyFilesChanged("upload-start");
+    return entry;
+  }
+
+  clearPendingUpload(id) {
+    const entry = this.pendingUploads.get(id);
+    if (!entry) return false;
+    clearTimeout(entry.timer);
+    this.pendingUploads.delete(id);
+    return true;
+  }
+
+  removePendingUpload(id, reason = "upload-cancelled") {
+    if (!this.clearPendingUpload(id)) return false;
+    this.notifyFilesChanged(reason);
+    return true;
+  }
+
+  listPendingUploads() {
+    return Array.from(this.pendingUploads.values())
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .map((entry) => ({
+        id: entry.id,
+        name: entry.name,
+        size: entry.size,
+        createdAt: entry.createdAt,
+        pending: true,
+      }));
+  }
+
   get(id) {
     const file = this.files.find((entry) => entry.id === id);
     if (!file || file.expiresAt <= Date.now()) return null;
@@ -113,6 +160,9 @@ class FileStore extends EventEmitter {
       lastDownloadedAt: null,
     };
     this.files.push(entry);
+    // The finished file carries the same id as its placeholder, so the single
+    // "upload" broadcast swaps shimmer for the real card everywhere at once.
+    this.clearPendingUpload(id);
     await this.saveFiles();
     this.notifyFilesChanged("upload");
     return toPublicFile(entry);
@@ -359,7 +409,7 @@ async function handleApi({ req, res, relative, store, getPort, eventClients }) {
 
   if (req.method === "GET" && relative === "/api/files") {
     await store.cleanupExpired();
-    sendJson(res, 200, { files: store.list(), settings: store.settings });
+    sendJson(res, 200, { files: store.list(), pending: store.listPendingUploads(), settings: store.settings });
     return;
   }
 
@@ -422,6 +472,10 @@ async function handleRawUpload(req, res, store) {
     },
   });
 
+  // Announce the upload before streaming so every device shows a placeholder
+  // while the bytes are still in flight.
+  store.addPendingUpload({ id, name: originalName, size: req.headers["content-length"] });
+
   try {
     await streamPipeline(
       req,
@@ -438,6 +492,7 @@ async function handleRawUpload(req, res, store) {
     });
     sendJson(res, 201, { files: [file] });
   } catch (err) {
+    store.removePendingUpload(id, "upload-failed");
     await removeIfExists(tempPath);
     if (req.aborted) {
       err.code = "UPLOAD_ABORTED";
@@ -462,12 +517,17 @@ async function handleUpload(req, res, store) {
   });
   const uploadPromises = [];
   const tempPaths = [];
+  const pendingIds = [];
 
   busboy.on("file", (_fieldName, fileStream, info) => {
     const originalName = info.filename || "unnamed-file";
     const id = crypto.randomUUID();
     const tempPath = path.join(store.tmpDir, `${id}.upload`);
     tempPaths.push(tempPath);
+    pendingIds.push(id);
+    // Per-file size isn't known upfront in multipart, so the placeholder shows
+    // the name and a shimmer until the real file lands.
+    store.addPendingUpload({ id, name: originalName, size: 0 });
     const hash = crypto.createHash("sha256");
     let size = 0;
 
@@ -519,6 +579,7 @@ async function handleUpload(req, res, store) {
     if (err.code === "UPLOAD_ABORTED") {
       await Promise.allSettled(uploadPromises);
       await Promise.allSettled(tempPaths.map((tempPath) => removeIfExists(tempPath)));
+      pendingIds.forEach((id) => store.removePendingUpload(id, "upload-failed"));
       throw err;
     }
     throw err;
@@ -529,6 +590,7 @@ async function handleUpload(req, res, store) {
     sendJson(res, 201, { files });
   } catch (err) {
     await Promise.allSettled(tempPaths.map((tempPath) => removeIfExists(tempPath)));
+    pendingIds.forEach((id) => store.removePendingUpload(id, "upload-failed"));
     sendJson(res, 500, { error: `Upload failed: ${err.message}` });
   }
 }

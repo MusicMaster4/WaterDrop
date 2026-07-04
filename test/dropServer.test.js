@@ -120,7 +120,7 @@ test("uploads, lists, previews, downloads, deletes, and clears files", async () 
   }
 });
 
-test("file change events are emitted as soon as uploads are committed", async () => {
+test("uploads announce a placeholder before committing", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-events-test-"));
   const rendererDir = path.join(root, "renderer");
   const dataDir = path.join(root, "data");
@@ -130,6 +130,8 @@ test("file change events are emitted as soon as uploads are committed", async ()
 
   const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 47980 });
   try {
+    // The first broadcast is the in-flight placeholder so every device can show
+    // a shimmer while bytes are still arriving; the commit event follows.
     const eventPromise = waitForFileEvent(new URL("api/events", server.localUrl));
     const form = new FormData();
     form.append("files", new Blob(["event-body"]), "event.txt");
@@ -138,8 +140,50 @@ test("file change events are emitted as soon as uploads are committed", async ()
     assert.equal(upload.status, 201);
 
     const event = await eventPromise;
-    assert.equal(event.reason, "upload");
+    assert.equal(event.reason, "upload-start");
     assert.equal(typeof event.at, "number");
+  } finally {
+    await server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("pending upload placeholder clears once the file lands", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-pending-test-"));
+  const rendererDir = path.join(root, "renderer");
+  const dataDir = path.join(root, "data");
+  const downloads = path.join(root, "downloads");
+  await fs.mkdir(rendererDir, { recursive: true });
+  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>WaterDrop</title>");
+
+  const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 47990 });
+  try {
+    // Register an in-flight upload directly and confirm the list surfaces it,
+    // then confirm committing the file removes the placeholder.
+    const id = "11111111-1111-4111-8111-111111111111";
+    server.store.addPendingUpload({ id, name: "big.bin", size: 4096 });
+
+    const listed = await (await fetch(new URL("api/files", server.localUrl))).json();
+    assert.equal(listed.pending.length, 1);
+    assert.equal(listed.pending[0].id, id);
+    assert.equal(listed.pending[0].name, "big.bin");
+    assert.equal(listed.pending[0].size, 4096);
+
+    const tempPath = path.join(server.store.tmpDir, `${id}.upload`);
+    await fs.writeFile(tempPath, "payload");
+    await server.store.addFromTemp({
+      id,
+      tempPath,
+      originalName: "big.bin",
+      mimeType: "application/octet-stream",
+      size: 7,
+      sha256: sha256(Buffer.from("payload")),
+    });
+
+    const after = await (await fetch(new URL("api/files", server.localUrl))).json();
+    assert.equal(after.pending.length, 0);
+    assert.equal(after.files.length, 1);
+    assert.equal(after.files[0].id, id);
   } finally {
     await server.close();
     await fs.rm(root, { recursive: true, force: true });

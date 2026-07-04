@@ -797,6 +797,66 @@ body::before {
   gap: 6px;
 }
 
+/* ---- Upload placeholder (in-flight upload, shown on every device) ---- */
+.file-placeholder {
+  cursor: default;
+  border-style: dashed;
+}
+.file-placeholder:hover {
+  border-color: var(--line);
+  background: var(--panel);
+}
+.file-tile-loading {
+  color: var(--faint);
+}
+.placeholder-icon {
+  position: relative;
+  z-index: 1;
+  opacity: 0.55;
+}
+.placeholder-status {
+  color: var(--faint);
+  letter-spacing: 0.06em;
+}
+.placeholder-line,
+.placeholder-pill {
+  display: block;
+  border-radius: 6px;
+}
+.placeholder-line {
+  height: 12px;
+  width: 44%;
+  margin-top: 2px;
+}
+.placeholder-pill {
+  height: 28px;
+  width: 66px;
+  border-radius: 8px;
+}
+.shimmer {
+  position: relative;
+  overflow: hidden;
+  background: var(--panel-strong);
+}
+.shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(247, 248, 250, 0.09) 50%,
+    transparent 100%
+  );
+  animation: shimmerSweep 1.4s var(--ease) infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .shimmer::after {
+    animation: none;
+  }
+}
+
 /* ---- Preview modal ---- */
 .preview-overlay {
   position: fixed;
@@ -1002,6 +1062,11 @@ body::before {
   to {
     opacity: 1;
     transform: none;
+  }
+}
+@keyframes shimmerSweep {
+  100% {
+    transform: translateX(100%);
   }
 }
 /* ============================================================
