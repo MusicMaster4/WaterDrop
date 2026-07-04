@@ -258,7 +258,11 @@ export default function App() {
     if (!window.waterdrop) return;
     const result = await window.waterdrop.chooseDownloadDir();
     if (result.ok) {
-      setSettings((current) => ({ ...current, downloadDir: result.downloadDir }));
+      if (result.settings) {
+        setSettings(result.settings);
+      } else {
+        setSettings((current) => ({ ...current, downloadDir: result.downloadDir }));
+      }
       notify("Folder saved", "ok");
     }
   }
@@ -621,7 +625,6 @@ export default function App() {
           >
             <UploadCloud className="dz-icon" size={34} strokeWidth={1.5} />
             <span className="dz-title">Drop files</span>
-            <span className="dz-sub mono">Original bytes, 7 day retention</span>
           </button>
 
           <input ref={fileInputRef} type="file" multiple hidden onChange={onFilesPicked} />

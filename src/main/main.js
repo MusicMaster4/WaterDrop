@@ -249,7 +249,7 @@ function wireIpc() {
       return { ok: false, canceled: true };
     }
     const downloadDir = await dropServer.store.setDownloadDir(result.filePaths[0]);
-    return { ok: true, downloadDir };
+    return { ok: true, downloadDir, settings: dropServer.store.settings };
   });
 
   ipcMain.handle("waterdrop:save-file", async (_event, id) => {
