@@ -101,6 +101,7 @@ export function canParallelUpload(record) {
   return (
     typeof fetch === "function" &&
     typeof AbortController === "function" &&
+    typeof XMLHttpRequest === "function" &&
     blob &&
     typeof blob.slice === "function" &&
     size >= UPLOAD_PARALLEL_MIN_BYTES
@@ -124,9 +125,79 @@ export async function parallelUpload({
 }) {
   const size = blob.size;
   const chunkCount = Math.ceil(size / UPLOAD_CHUNK_SIZE);
-  let uploadedBytes = 0;
+  const chunkProgress = new Array(chunkCount).fill(0);
   let nextIndex = 0;
   let resultFile = null;
+
+  const reportProgress = () => {
+    const uploadedBytes = chunkProgress.reduce((sum, bytes) => sum + bytes, 0);
+    // Reaching 100 here only means the browser has sent all request bodies.
+    // The caller marks 100/done after the server confirms the file is committed.
+    onProgress?.(Math.max(1, Math.min(99, Math.round((uploadedBytes / size) * 100))));
+  };
+
+  const uploadChunk = (index, start, end) =>
+    new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new DOMException("Aborted", "AbortError"));
+        return;
+      }
+
+      const xhr = new XMLHttpRequest();
+      const length = end - start;
+      const cleanup = () => {
+        signal?.removeEventListener?.("abort", onAbort);
+      };
+      const onAbort = () => {
+        xhr.abort();
+      };
+
+      xhr.open("POST", uploadUrl, true);
+      xhr.setRequestHeader("Content-Type", mimeType || "application/octet-stream");
+      xhr.setRequestHeader("X-WaterDrop-File-Name", encodeURIComponent(name || "unnamed-file"));
+      xhr.setRequestHeader("X-WaterDrop-Mime-Type", mimeType || "application/octet-stream");
+      xhr.setRequestHeader("X-WaterDrop-Upload-Id", id);
+      xhr.setRequestHeader("X-WaterDrop-Chunk-Offset", String(start));
+      xhr.setRequestHeader("X-WaterDrop-Total-Size", String(size));
+      if (folderId) xhr.setRequestHeader("X-WaterDrop-Folder-Id", folderId);
+
+      xhr.upload.onprogress = (event) => {
+        onActivity?.();
+        if (!event.lengthComputable) return;
+        chunkProgress[index] = Math.min(length, event.loaded);
+        reportProgress();
+      };
+      xhr.upload.onload = () => {
+        onActivity?.();
+        chunkProgress[index] = length;
+        reportProgress();
+      };
+      xhr.onload = () => {
+        cleanup();
+        onActivity?.();
+        if (xhr.status < 200 || xhr.status >= 300) {
+          reject(new Error(`HTTP ${xhr.status}`));
+          return;
+        }
+        try {
+          resolve(xhr.responseText ? JSON.parse(xhr.responseText) : {});
+        } catch {
+          resolve({});
+        }
+      };
+      xhr.onerror = () => {
+        cleanup();
+        reject(new Error("Network error"));
+      };
+      xhr.onabort = () => {
+        cleanup();
+        reject(new DOMException("Aborted", "AbortError"));
+      };
+      signal?.addEventListener?.("abort", onAbort, { once: true });
+      xhr.send(blob.slice(start, end));
+    });
+
+  onProgress?.(1);
 
   async function worker() {
     while (true) {
@@ -135,26 +206,7 @@ export async function parallelUpload({
       if (index >= chunkCount) return;
       const start = index * UPLOAD_CHUNK_SIZE;
       const end = Math.min(size, start + UPLOAD_CHUNK_SIZE);
-      const headers = {
-        "Content-Type": mimeType || "application/octet-stream",
-        "X-WaterDrop-File-Name": encodeURIComponent(name || "unnamed-file"),
-        "X-WaterDrop-Mime-Type": mimeType || "application/octet-stream",
-        "X-WaterDrop-Upload-Id": id,
-        "X-WaterDrop-Chunk-Offset": String(start),
-        "X-WaterDrop-Total-Size": String(size),
-      };
-      if (folderId) headers["X-WaterDrop-Folder-Id"] = folderId;
-      const response = await fetch(uploadUrl, {
-        method: "POST",
-        body: blob.slice(start, end),
-        headers,
-        signal,
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = await response.json().catch(() => ({}));
-      uploadedBytes += end - start;
-      onActivity?.();
-      onProgress?.(Math.min(100, Math.round((uploadedBytes / size) * 100)));
+      const data = await uploadChunk(index, start, end);
       if (data && Array.isArray(data.files) && data.files.length) resultFile = data.files[0];
     }
   }

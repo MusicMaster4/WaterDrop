@@ -623,7 +623,9 @@ export default function App() {
           folderName: targetFolder?.name,
         });
         queued += 1;
-        setUploads((items) => upsertUpload(items, uploadRecordToView(record)));
+        setUploads((items) =>
+          upsertUpload(items, { ...uploadRecordToView(record), progress: 1 })
+        );
         if (await startBackgroundFetchUpload(record)) {
           browserBackground += 1;
         }
@@ -666,7 +668,7 @@ export default function App() {
     const id = crypto.randomUUID();
     setUploads((items) => [
       ...items,
-      { id, name: file.name, size: file.size, progress: 0, status: "uploading", createdAt: Date.now() },
+      { id, name: file.name, size: file.size, progress: 1, status: "uploading", createdAt: Date.now() },
     ]);
 
     const xhr = new XMLHttpRequest();
@@ -681,7 +683,7 @@ export default function App() {
     }
     xhr.upload.onprogress = (event) => {
       if (!event.lengthComputable) return;
-      const progress = Math.round((event.loaded / event.total) * 100);
+      const progress = Math.max(1, Math.min(99, Math.round((event.loaded / event.total) * 100)));
       setUploads((items) =>
         items.map((item) => (item.id === id ? { ...item, progress } : item))
       );
@@ -1846,9 +1848,9 @@ async function uploadQueuedRecord({
     ? new URL("api/files/raw", transferBase).toString()
     : record.uploadUrl || api.rawUploadUrl;
   const view = uploadRecordToView(record);
-  setUploads((items) => upsertUpload(items, { ...view, status: "uploading", progress: 0 }));
+  setUploads((items) => upsertUpload(items, { ...view, status: "uploading", progress: 1 }));
 
-  let lastPersistedProgress = 0;
+  let lastPersistedProgress = 1;
   const lockTimer = window.setInterval(() => {
     touchQueuedUploadLock(record.id).catch(() => {});
   }, Math.max(5000, Math.floor(PAGE_UPLOAD_LOCK_MS / 3)));
@@ -1888,10 +1890,11 @@ async function uploadQueuedRecord({
         lastActivityAt = Date.now();
       };
       const applyProgress = (progress) => {
-        setUploads((items) => upsertUpload(items, { ...view, status: "uploading", progress }));
+        const visibleProgress = Math.max(1, Math.min(99, progress));
+        setUploads((items) => upsertUpload(items, { ...view, status: "uploading", progress: visibleProgress }));
         if (progress - lastPersistedProgress >= 10 || progress === 100) {
-          lastPersistedProgress = progress;
-          updateQueuedUploadProgress(record.id, progress).catch(() => {});
+          lastPersistedProgress = visibleProgress;
+          updateQueuedUploadProgress(record.id, visibleProgress).catch(() => {});
         }
       };
       const onOffline = () => fail("Upload paused while offline");
@@ -1915,11 +1918,9 @@ async function uploadQueuedRecord({
         const controller = new AbortController();
         activeController = controller;
         markActivity();
-        // fetch can't report sub-chunk upload progress, and a single 8 MB chunk
-        // split across parallel connections can take well over the stall window
-        // on a slow link. Keep the connection considered "alive" on a heartbeat;
-        // real drops are still caught by offline/pagehide/visibility and by the
-        // fetch itself rejecting.
+        // XHR reports sub-chunk upload progress, but the final server-side hash
+        // can still spend time after all bytes are sent. Keep the connection
+        // considered "alive" while the final response is pending.
         heartbeat = window.setInterval(markActivity, 15000);
         parallelUpload({
           blob: record.blob,

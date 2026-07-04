@@ -23,7 +23,7 @@ export async function queueUpload(file, uploadUrl, options = {}) {
     blob: file,
     uploadUrl,
     status: "queued",
-    progress: 0,
+    progress: 1,
     attempts: 0,
     createdAt: now,
     updatedAt: now,
@@ -71,7 +71,7 @@ export async function claimQueuedUpload(id) {
   const claimed = {
     ...record,
     status: "uploading",
-    progress: 0,
+    progress: Math.max(1, Number(record.progress || 0)),
     updatedAt: now,
     lockedUntil: now + PAGE_UPLOAD_LOCK_MS,
     lastError: "",
@@ -97,7 +97,7 @@ export async function updateQueuedUploadProgress(id, progress) {
   if (!record) return null;
   const updated = {
     ...record,
-    progress: Math.max(0, Math.min(100, Number(progress || 0))),
+    progress: Math.max(1, Math.min(99, Number(progress || 0))),
     updatedAt: Date.now(),
   };
   await putUploadRecord(updated);
