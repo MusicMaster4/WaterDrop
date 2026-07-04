@@ -90,8 +90,9 @@ class FileStore extends EventEmitter {
     const now = Date.now();
     return this.files
       .filter((file) => file.expiresAt > now)
+      .filter((file) => !file.folderId)
       .sort((a, b) => b.createdAt - a.createdAt)
-      .map((file) => toPublicFile(file));
+      .map((file) => toPublicFile(file, this));
   }
 
   addPendingUpload({ id, name, size }) {
@@ -142,7 +143,61 @@ class FileStore extends EventEmitter {
     return file;
   }
 
-  async addFromTemp({ id, tempPath, originalName, mimeType, size, sha256 }) {
+  getFolder(id) {
+    const folder = this.get(id);
+    if (!folder || folder.kind !== "folder") return null;
+    return folder;
+  }
+
+  getFolderChildren(folderId) {
+    const now = Date.now();
+    return this.files
+      .filter((entry) => entry.folderId === folderId && entry.expiresAt > now)
+      .sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  async createFolder({ name } = {}) {
+    const now = Date.now();
+    const entry = {
+      id: crypto.randomUUID(),
+      kind: "folder",
+      name: safeDisplayName(name || this.nextFolderName()),
+      size: 0,
+      createdAt: now,
+      expiresAt: now + RETENTION_MS,
+      downloads: 0,
+      lastDownloadedAt: null,
+    };
+    this.files.push(entry);
+    await this.saveFiles();
+    this.notifyFilesChanged("folder-create");
+    return toPublicFile(entry, this);
+  }
+
+  async renameFolder(id, name) {
+    const folder = this.getFolder(id);
+    if (!folder) return null;
+    folder.name = safeDisplayName(name || folder.name);
+    await this.saveFiles();
+    this.notifyFilesChanged("folder-rename");
+    return toPublicFile(folder, this);
+  }
+
+  nextFolderName() {
+    const used = new Set(
+      this.files
+        .filter((entry) => entry.kind === "folder" && entry.expiresAt > Date.now())
+        .map((entry) => String(entry.name || "").toLowerCase())
+    );
+    for (let i = 1; i < 1000; i += 1) {
+      const name = `Folder${i}`;
+      if (!used.has(name.toLowerCase())) return name;
+    }
+    return `Folder${Date.now()}`;
+  }
+
+  async addFromTemp({ id, tempPath, originalName, mimeType, size, sha256, folderId }) {
+    const folder = folderId ? this.getFolder(folderId) : null;
     const ext = safeExtension(originalName);
     const storedName = `${id}${ext}`;
     const finalPath = path.join(this.filesDir, storedName);
@@ -156,17 +211,18 @@ class FileStore extends EventEmitter {
       size,
       sha256,
       createdAt: now,
-      expiresAt: now + RETENTION_MS,
+      expiresAt: folder ? folder.expiresAt : now + RETENTION_MS,
       downloads: 0,
       lastDownloadedAt: null,
     };
+    if (folder) entry.folderId = folder.id;
     this.files.push(entry);
     // The finished file carries the same id as its placeholder, so the single
     // "upload" broadcast swaps shimmer for the real card everywhere at once.
     this.clearPendingUpload(id);
     await this.saveFiles();
     this.notifyFilesChanged("upload");
-    return toPublicFile(entry);
+    return toPublicFile(entry, this);
   }
 
   async recordDownload(id) {
@@ -225,7 +281,16 @@ class FileStore extends EventEmitter {
     const index = this.files.findIndex((entry) => entry.id === id);
     if (index === -1) return false;
     const [file] = this.files.splice(index, 1);
-    await removeIfExists(this.pathFor(file));
+    const payloads = file.kind === "folder" ? this.files.filter((entry) => entry.folderId === file.id) : [file];
+    if (file.kind === "folder") {
+      this.files = this.files.filter((entry) => entry.folderId !== file.id);
+    }
+    await Promise.all(
+      payloads.flatMap((entry) => [
+        removeIfExists(this.pathFor(entry)),
+        removeDirIfExists(path.join(this.dragDir, entry.id)),
+      ])
+    );
     await removeDirIfExists(path.join(this.dragDir, file.id));
     await this.saveFiles();
     this.notifyFilesChanged("delete");
@@ -235,17 +300,18 @@ class FileStore extends EventEmitter {
   async clear() {
     const files = this.files;
     this.files = [];
-    await Promise.all(files.map((file) => removeIfExists(this.pathFor(file))));
+    await Promise.all(files.filter((file) => file.kind !== "folder").map((file) => removeIfExists(this.pathFor(file))));
     await removeDirIfExists(this.dragDir);
     await fsp.mkdir(this.dragDir, { recursive: true });
     await this.saveFiles();
     if (files.length) this.notifyFilesChanged("clear");
-    return files.length;
+    return files.filter((file) => !file.folderId).length;
   }
 
   prepareDragFile(id) {
     const file = this.get(id);
     if (!file) throw new Error("File not found");
+    if (file.kind === "folder") throw new Error("Drag folders from the saved ZIP.");
 
     const source = this.pathFor(file);
     const dragFileRoot = path.join(this.dragDir, file.id);
@@ -274,21 +340,31 @@ class FileStore extends EventEmitter {
     if (!file) throw new Error("File not found");
     const destinationDir = targetDir || this.settings.downloadDir || this.defaultDownloadDir;
     await fsp.mkdir(destinationDir, { recursive: true });
-    const destination = await uniqueDestination(destinationDir, file.name);
-    await fsp.copyFile(this.pathFor(file), destination);
+    const destinationName = file.kind === "folder" ? ensureZipName(file.name) : file.name;
+    const destination = await uniqueDestination(destinationDir, destinationName);
+    if (file.kind === "folder") {
+      await writeFolderZipToPath(this, file, destination);
+    } else {
+      await fsp.copyFile(this.pathFor(file), destination);
+    }
     return destination;
   }
 
   async cleanupExpired() {
     const now = Date.now();
-    const expired = this.files.filter((file) => file.expiresAt <= now);
+    const expiredFolderIds = new Set(
+      this.files.filter((file) => file.kind === "folder" && file.expiresAt <= now).map((file) => file.id)
+    );
+    const expired = this.files.filter((file) => file.expiresAt <= now || expiredFolderIds.has(file.folderId));
     if (!expired.length) return 0;
-    this.files = this.files.filter((file) => file.expiresAt > now);
+    const expiredIds = new Set(expired.map((file) => file.id));
+    this.files = this.files.filter((file) => !expiredIds.has(file.id));
     await Promise.all(
-      expired.flatMap((file) => [
-        removeIfExists(this.pathFor(file)),
-        removeDirIfExists(path.join(this.dragDir, file.id)),
-      ])
+      expired.flatMap((file) => {
+        const tasks = [removeDirIfExists(path.join(this.dragDir, file.id))];
+        if (file.kind !== "folder") tasks.push(removeIfExists(this.pathFor(file)));
+        return tasks;
+      })
     );
     await this.saveFiles();
     this.notifyFilesChanged("expire");
@@ -429,10 +505,28 @@ async function handleApi({ req, res, relative, store, getPort, eventClients }) {
     return;
   }
 
+  if (req.method === "POST" && relative === "/api/folders") {
+    const body = await readRequestJson(req);
+    const folder = await store.createFolder({ name: body.name });
+    sendJson(res, 201, { folder });
+    return;
+  }
+
   if (req.method === "DELETE" && relative === "/api/files") {
     const deleted = await store.clear();
     sendJson(res, 200, { ok: true, deleted });
     return;
+  }
+
+  const folderMatch = relative.match(/^\/api\/folders\/([a-f0-9-]+)$/);
+  if (folderMatch) {
+    const id = folderMatch[1];
+    if (req.method === "PATCH") {
+      const body = await readRequestJson(req);
+      const folder = await store.renameFolder(id, body.name);
+      sendJson(res, folder ? 200 : 404, folder ? { folder } : { error: "Folder not found" });
+      return;
+    }
   }
 
   const fileMatch = relative.match(/^\/api\/files\/([a-f0-9-]+)(?:\/(download|preview))?$/);
@@ -461,11 +555,18 @@ async function handleRawUpload(req, res, store) {
   const originalName = decodeHeaderValue(req.headers["x-waterdrop-file-name"]) || "unnamed-file";
   const mimeType = cleanHeaderValue(req.headers["x-waterdrop-mime-type"]) || cleanMimeType(req.headers["content-type"]);
   const requestedId = cleanHeaderValue(req.headers["x-waterdrop-upload-id"]);
+  const requestedFolderId = cleanHeaderValue(req.headers["x-waterdrop-folder-id"]);
+  const folderId = isValidFileId(requestedFolderId) ? requestedFolderId : "";
+  if (folderId && !store.getFolder(folderId)) {
+    req.resume();
+    sendJson(res, 404, { error: "Folder not found" });
+    return;
+  }
   const id = isValidFileId(requestedId) ? requestedId : crypto.randomUUID();
   const existingFile = store.get(id);
   if (existingFile) {
     req.resume();
-    sendJson(res, 200, { files: [toPublicFile(existingFile)], duplicate: true });
+    sendJson(res, 200, { files: [toPublicFile(existingFile, store)], duplicate: true });
     return;
   }
 
@@ -494,7 +595,7 @@ async function handleRawUpload(req, res, store) {
     const finishedElsewhere = store.get(id);
     if (finishedElsewhere) {
       await removeIfExists(tempPath);
-      sendJson(res, 200, { files: [toPublicFile(finishedElsewhere)], duplicate: true });
+      sendJson(res, 200, { files: [toPublicFile(finishedElsewhere, store)], duplicate: true });
       return;
     }
     const file = await store.addFromTemp({
@@ -504,6 +605,7 @@ async function handleRawUpload(req, res, store) {
       mimeType,
       size,
       sha256: hash.digest("hex"),
+      folderId,
     });
     sendJson(res, 201, { files: [file] });
   } catch (err) {
@@ -611,6 +713,11 @@ async function handleUpload(req, res, store) {
 }
 
 async function handleDownload(req, res, store, id) {
+  const file = store.get(id);
+  if (file?.kind === "folder") {
+    await sendFolderZip({ req, res, store, folder: file });
+    return;
+  }
   await sendStoredFile({
     req,
     res,
@@ -623,6 +730,11 @@ async function handleDownload(req, res, store, id) {
 }
 
 async function handlePreview(req, res, store, id) {
+  const file = store.get(id);
+  if (file?.kind === "folder") {
+    sendJson(res, 415, { error: "Folders can be downloaded as ZIP files." });
+    return;
+  }
   await sendStoredFile({
     req,
     res,
@@ -632,6 +744,28 @@ async function handlePreview(req, res, store, id) {
     cacheControl: "private, max-age=60, no-transform",
     recordDownload: false,
   });
+}
+
+async function sendFolderZip({ req, res, store, folder }) {
+  const entries = await buildZipEntries(store, folder);
+  const encodedName = encodeRFC5987(ensureZipName(folder.name));
+  res.writeHead(200, {
+    ...corsHeaders(),
+    "Cache-Control": "private, max-age=0, no-transform",
+    "Content-Disposition": `attachment; filename="${asciiFileName(ensureZipName(folder.name))}"; filename*=UTF-8''${encodedName}`,
+    "Content-Type": "application/zip",
+    "X-Content-Type-Options": "nosniff",
+  });
+  if (req.method === "HEAD") {
+    res.end();
+    return;
+  }
+  recordDownloadAfterResponse(res, store, folder.id);
+  try {
+    await writeZipToStream(entries, res);
+  } catch (err) {
+    if (!res.destroyed) res.destroy(err);
+  }
 }
 
 async function sendStoredFile({ req, res, store, id, disposition, cacheControl, recordDownload }) {
@@ -713,6 +847,149 @@ function pipeFileToResponse(res, filePath, options) {
 function recordDownloadAfterResponse(res, store, id) {
   res.once("finish", () => {
     store.scheduleDownloadRecord(id);
+  });
+}
+
+async function writeFolderZipToPath(store, folder, destination) {
+  const entries = await buildZipEntries(store, folder);
+  const output = fs.createWriteStream(destination, { highWaterMark: DOWNLOAD_HIGH_WATER_MARK });
+  try {
+    await writeZipToStream(entries, output);
+  } catch (err) {
+    output.destroy();
+    await removeIfExists(destination);
+    throw err;
+  }
+}
+
+async function buildZipEntries(store, folder) {
+  const children = store.getFolderChildren(folder.id);
+  const usedNames = new Set();
+  const entries = [];
+  for (const child of children) {
+    const filePath = store.pathFor(child);
+    const stat = await fsp.stat(filePath);
+    if (stat.size > 0xffffffff) throw new Error("ZIP download does not support files over 4 GB");
+    const name = uniqueArchiveName(usedNames, safeDisplayName(child.name));
+    entries.push({
+      name,
+      path: filePath,
+      size: stat.size,
+      crc32: await crc32File(filePath),
+      modifiedAt: child.createdAt || Date.now(),
+    });
+  }
+  return entries;
+}
+
+async function writeZipToStream(entries, stream) {
+  if (entries.length > 0xffff) throw new Error("ZIP download does not support more than 65535 files");
+  let offset = 0;
+  const centralRecords = [];
+
+  for (const entry of entries) {
+    const nameBuffer = Buffer.from(entry.name, "utf8");
+    const { time, date } = dosDateTime(entry.modifiedAt);
+    const localOffset = offset;
+    const localHeader = Buffer.alloc(30);
+    localHeader.writeUInt32LE(0x04034b50, 0);
+    localHeader.writeUInt16LE(20, 4);
+    localHeader.writeUInt16LE(0, 6);
+    localHeader.writeUInt16LE(0, 8);
+    localHeader.writeUInt16LE(time, 10);
+    localHeader.writeUInt16LE(date, 12);
+    localHeader.writeUInt32LE(entry.crc32 >>> 0, 14);
+    localHeader.writeUInt32LE(entry.size, 18);
+    localHeader.writeUInt32LE(entry.size, 22);
+    localHeader.writeUInt16LE(nameBuffer.length, 26);
+    localHeader.writeUInt16LE(0, 28);
+    await writeBuffer(stream, localHeader);
+    await writeBuffer(stream, nameBuffer);
+    offset += localHeader.length + nameBuffer.length;
+
+    for await (const chunk of fs.createReadStream(entry.path, { highWaterMark: DOWNLOAD_HIGH_WATER_MARK })) {
+      await writeBuffer(stream, chunk);
+      offset += chunk.length;
+    }
+
+    centralRecords.push({ entry, nameBuffer, time, date, localOffset });
+  }
+
+  const centralStart = offset;
+  for (const record of centralRecords) {
+    const header = Buffer.alloc(46);
+    header.writeUInt32LE(0x02014b50, 0);
+    header.writeUInt16LE(20, 4);
+    header.writeUInt16LE(20, 6);
+    header.writeUInt16LE(0, 8);
+    header.writeUInt16LE(0, 10);
+    header.writeUInt16LE(record.time, 12);
+    header.writeUInt16LE(record.date, 14);
+    header.writeUInt32LE(record.entry.crc32 >>> 0, 16);
+    header.writeUInt32LE(record.entry.size, 20);
+    header.writeUInt32LE(record.entry.size, 24);
+    header.writeUInt16LE(record.nameBuffer.length, 28);
+    header.writeUInt16LE(0, 30);
+    header.writeUInt16LE(0, 32);
+    header.writeUInt16LE(0, 34);
+    header.writeUInt16LE(0, 36);
+    header.writeUInt32LE(0, 38);
+    header.writeUInt32LE(record.localOffset, 42);
+    await writeBuffer(stream, header);
+    await writeBuffer(stream, record.nameBuffer);
+    offset += header.length + record.nameBuffer.length;
+  }
+
+  const centralSize = offset - centralStart;
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(centralRecords.length, 8);
+  end.writeUInt16LE(centralRecords.length, 10);
+  end.writeUInt32LE(centralSize, 12);
+  end.writeUInt32LE(centralStart, 16);
+  end.writeUInt16LE(0, 20);
+  await writeBuffer(stream, end);
+  await endStream(stream);
+}
+
+function writeBuffer(stream, buffer) {
+  return new Promise((resolve, reject) => {
+    if (stream.destroyed) {
+      reject(new Error("Stream closed"));
+      return;
+    }
+    const onError = (err) => {
+      cleanup();
+      reject(err);
+    };
+    const onDrain = () => {
+      cleanup();
+      resolve();
+    };
+    const cleanup = () => {
+      stream.off("error", onError);
+      stream.off("drain", onDrain);
+    };
+    stream.once("error", onError);
+    if (stream.write(buffer)) {
+      cleanup();
+      resolve();
+      return;
+    }
+    stream.once("drain", onDrain);
+  });
+}
+
+function endStream(stream) {
+  return new Promise((resolve, reject) => {
+    if (stream.writableEnded || stream.destroyed) {
+      resolve();
+      return;
+    }
+    stream.once("error", reject);
+    stream.end(resolve);
   });
 }
 
@@ -868,9 +1145,28 @@ function isValidFileId(id) {
   return typeof id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
 }
 
-function toPublicFile(file) {
+function toPublicFile(file, store = null) {
+  if (file.kind === "folder") {
+    const children = store ? store.getFolderChildren(file.id) : [];
+    const size = children.reduce((sum, child) => sum + Number(child.size || 0), 0);
+    return {
+      id: file.id,
+      kind: "folder",
+      name: file.name,
+      mimeType: "application/zip",
+      size,
+      itemCount: children.length,
+      files: children.map((child) => toPublicFolderChild(child)),
+      createdAt: file.createdAt,
+      expiresAt: file.expiresAt,
+      expiresInMs: Math.max(0, file.expiresAt - Date.now()),
+      downloads: file.downloads || 0,
+      lastDownloadedAt: file.lastDownloadedAt || null,
+    };
+  }
   return {
     id: file.id,
+    kind: "file",
     name: file.name,
     mimeType: file.mimeType,
     size: file.size,
@@ -880,6 +1176,19 @@ function toPublicFile(file) {
     expiresInMs: Math.max(0, file.expiresAt - Date.now()),
     downloads: file.downloads || 0,
     lastDownloadedAt: file.lastDownloadedAt || null,
+  };
+}
+
+function toPublicFolderChild(file) {
+  return {
+    id: file.id,
+    kind: "file",
+    name: file.name,
+    mimeType: file.mimeType,
+    size: file.size,
+    sha256: file.sha256,
+    createdAt: file.createdAt,
+    expiresAt: file.expiresAt,
   };
 }
 
@@ -896,8 +1205,8 @@ function sendJson(res, status, payload) {
 
 function corsHeaders() {
   return {
-    "Access-Control-Allow-Headers": "Content-Type, Range, X-WaterDrop-File-Name, X-WaterDrop-Mime-Type, X-WaterDrop-Upload-Id",
-    "Access-Control-Allow-Methods": "GET, HEAD, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Range, X-WaterDrop-File-Name, X-WaterDrop-Mime-Type, X-WaterDrop-Upload-Id, X-WaterDrop-Folder-Id",
+    "Access-Control-Allow-Methods": "GET, HEAD, POST, PATCH, DELETE, OPTIONS",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Expose-Headers": "Accept-Ranges, Content-Disposition, Content-Length, Content-Range, ETag, Last-Modified, X-WaterDrop-SHA256",
   };
@@ -914,6 +1223,17 @@ async function readJson(filePath, fallback) {
   } catch {
     return fallback;
   }
+}
+
+async function readRequestJson(req) {
+  const chunks = [];
+  for await (const chunk of req) {
+    chunks.push(chunk);
+    if (Buffer.concat(chunks).length > 64 * 1024) throw new Error("Request body too large");
+  }
+  const text = Buffer.concat(chunks).toString("utf8").trim();
+  if (!text) return {};
+  return JSON.parse(text);
 }
 
 async function writeJsonAtomic(filePath, value) {
@@ -943,6 +1263,62 @@ function safeDisplayName(name) {
 function safeExtension(name) {
   const ext = path.extname(safeDisplayName(name)).slice(0, 24);
   return ext.replace(/[^a-zA-Z0-9.]/g, "");
+}
+
+function ensureZipName(name) {
+  const safeName = safeDisplayName(name || "folder");
+  return /\.zip$/i.test(safeName) ? safeName : `${safeName}.zip`;
+}
+
+function uniqueArchiveName(usedNames, name) {
+  const safeName = safeDisplayName(name);
+  const parsed = path.parse(safeName);
+  for (let i = 0; i < 1000; i += 1) {
+    const candidate = i === 0 ? safeName : `${parsed.name} (${i})${parsed.ext}`;
+    const key = candidate.toLowerCase();
+    if (!usedNames.has(key)) {
+      usedNames.add(key);
+      return candidate;
+    }
+  }
+  throw new Error("Could not find a unique ZIP entry name");
+}
+
+async function crc32File(filePath) {
+  let crc = 0xffffffff;
+  for await (const chunk of fs.createReadStream(filePath, { highWaterMark: DOWNLOAD_HIGH_WATER_MARK })) {
+    crc = crc32Update(crc, chunk);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i += 1) {
+    let value = i;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    }
+    table[i] = value >>> 0;
+  }
+  return table;
+})();
+
+function crc32Update(crc, buffer) {
+  let next = crc >>> 0;
+  for (const byte of buffer) {
+    next = CRC32_TABLE[(next ^ byte) & 0xff] ^ (next >>> 8);
+  }
+  return next >>> 0;
+}
+
+function dosDateTime(timestamp) {
+  const date = new Date(timestamp || Date.now());
+  const year = Math.max(1980, date.getFullYear());
+  return {
+    time: (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2),
+    date: ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate(),
+  };
 }
 
 function asciiFileName(name) {

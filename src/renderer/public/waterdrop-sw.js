@@ -79,6 +79,7 @@ async function uploadRecord(record) {
       "X-WaterDrop-File-Name": encodeURIComponent(record.name || "unnamed-file"),
       "X-WaterDrop-Mime-Type": record.mimeType || "application/octet-stream",
       "X-WaterDrop-Upload-Id": record.id,
+      ...(record.folderId ? { "X-WaterDrop-Folder-Id": record.folderId } : {}),
     },
   });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);

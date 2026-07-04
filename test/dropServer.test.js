@@ -209,6 +209,89 @@ test("pending upload placeholder clears once the file lands", async () => {
   }
 });
 
+test("bulk upload folders group files, rename, download as zip, and delete children", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-folder-test-"));
+  const rendererDir = path.join(root, "renderer");
+  const dataDir = path.join(root, "data");
+  const downloads = path.join(root, "downloads");
+  await fs.mkdir(rendererDir, { recursive: true });
+  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>WaterDrop</title>");
+
+  const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 48010 });
+  try {
+    const base = server.localUrl;
+    const created = await fetch(new URL("api/folders", base), {
+      method: "POST",
+      body: JSON.stringify({}),
+      headers: { "Content-Type": "application/json" },
+    });
+    assert.equal(created.status, 201);
+    const createdBody = await created.json();
+    assert.equal(createdBody.folder.kind, "folder");
+    assert.equal(createdBody.folder.name, "Folder1");
+    assert.equal(createdBody.folder.itemCount, 0);
+    const folderId = createdBody.folder.id;
+
+    for (const [id, name, body] of [
+      ["33333333-3333-4333-8333-333333333333", "one.txt", "one"],
+      ["44444444-4444-4444-8444-444444444444", "two.txt", "two"],
+    ]) {
+      const upload = await fetch(new URL("api/files/raw", base), {
+        method: "POST",
+        body: new Blob([body], { type: "text/plain" }),
+        headers: {
+          "Content-Type": "text/plain",
+          "X-WaterDrop-File-Name": encodeURIComponent(name),
+          "X-WaterDrop-Mime-Type": "text/plain",
+          "X-WaterDrop-Upload-Id": id,
+          "X-WaterDrop-Folder-Id": folderId,
+        },
+      });
+      assert.equal(upload.status, 201);
+    }
+
+    const listed = await (await fetch(new URL("api/files", base))).json();
+    assert.equal(listed.files.length, 1);
+    assert.equal(listed.files[0].kind, "folder");
+    assert.equal(listed.files[0].itemCount, 2);
+    assert.equal(listed.files[0].size, 6);
+    assert.deepEqual(listed.files[0].files.map((file) => file.name), ["one.txt", "two.txt"]);
+
+    const renamed = await fetch(new URL(`api/folders/${folderId}`, base), {
+      method: "PATCH",
+      body: JSON.stringify({ name: "Trip Photos" }),
+      headers: { "Content-Type": "application/json" },
+    });
+    assert.equal(renamed.status, 200);
+    const renamedBody = await renamed.json();
+    assert.equal(renamedBody.folder.name, "Trip Photos");
+
+    const zip = await fetch(new URL(`api/files/${folderId}/download`, base));
+    assert.equal(zip.status, 200);
+    assert.equal(zip.headers.get("content-type"), "application/zip");
+    assert.match(zip.headers.get("content-disposition"), /^attachment; filename="Trip Photos\.zip"/);
+    const zipBytes = Buffer.from(await zip.arrayBuffer());
+    assert.equal(zipBytes.readUInt32LE(0), 0x04034b50);
+    assert.equal(zipBytes.includes(Buffer.from("one.txt")), true);
+    assert.equal(zipBytes.includes(Buffer.from("two.txt")), true);
+    await waitForDownloads(base, folderId, 1);
+
+    const savedZip = await server.store.copyToDownloadDir(folderId);
+    assert.equal(path.basename(savedZip), "Trip Photos.zip");
+    const savedZipBytes = await fs.readFile(savedZip);
+    assert.equal(savedZipBytes.readUInt32LE(0), 0x04034b50);
+
+    const deleted = await fetch(new URL(`api/files/${folderId}`, base), { method: "DELETE" });
+    assert.equal(deleted.status, 200);
+    const afterDelete = await (await fetch(new URL("api/files", base))).json();
+    assert.equal(afterDelete.files.length, 0);
+    assert.equal(server.store.files.length, 0);
+  } finally {
+    await server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 function sha256(buffer) {
   return crypto.createHash("sha256").update(buffer).digest("hex");
 }

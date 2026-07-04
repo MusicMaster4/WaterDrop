@@ -18,6 +18,7 @@ import {
   Info,
   MonitorUp,
   MoreHorizontal,
+  Pencil,
   QrCode,
   RefreshCw,
   Server,
@@ -67,6 +68,8 @@ const apiDefault = {
   rawUploadUrl: "api/files/raw",
   downloadUrl: (id) => `api/files/${id}/download`,
   previewUrl: (id) => `api/files/${id}/preview`,
+  createFolder: (name) => request("api/folders", { method: "POST", body: JSON.stringify({ name }) }),
+  renameFolder: (id, name) => request(`api/folders/${id}`, { method: "PATCH", body: JSON.stringify({ name }) }),
   clearFiles: () => request("api/files", { method: "DELETE" }),
   deleteFile: (id) => request(`api/files/${id}`, { method: "DELETE" }),
   configureServe: () => request("api/tailscale/serve", { method: "POST" }),
@@ -83,6 +86,8 @@ function buildApi(baseUrl = "") {
     rawUploadUrl: join("api/files/raw"),
     downloadUrl: (id) => join(`api/files/${id}/download`),
     previewUrl: (id) => join(`api/files/${id}/preview`),
+    createFolder: (name) => request(join("api/folders"), { method: "POST", body: JSON.stringify({ name }) }),
+    renameFolder: (id, name) => request(join(`api/folders/${id}`), { method: "PATCH", body: JSON.stringify({ name }) }),
     clearFiles: () => request(join("api/files"), { method: "DELETE" }),
     deleteFile: (id) => request(join(`api/files/${id}`), { method: "DELETE" }),
     configureServe: () => request(join("api/tailscale/serve"), { method: "POST" }),
@@ -104,6 +109,7 @@ export default function App() {
   const [pending, setPending] = useState([]);
   const [settings, setSettings] = useState({});
   const [uploads, setUploads] = useState([]);
+  const [createFolderUpload, setCreateFolderUpload] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(true);
   const [qrOpen, setQrOpen] = useState(false);
@@ -528,8 +534,19 @@ export default function App() {
   async function uploadFiles(picked) {
     const valid = picked.filter(Boolean);
     if (!valid.length) return;
+    let targetFolder = null;
+    if (createFolderUpload) {
+      try {
+        const result = await api.createFolder();
+        targetFolder = result.folder;
+        await refreshFiles({ silent: true });
+      } catch (err) {
+        notify(err.message || "Could not create folder", "warn");
+        return;
+      }
+    }
     if (!api.rawUploadUrl || !isUploadQueueSupported()) {
-      valid.forEach((file) => uploadOneLegacy(file));
+      valid.forEach((file) => uploadOneLegacy(file, targetFolder));
       return;
     }
 
@@ -537,7 +554,10 @@ export default function App() {
     let browserBackground = 0;
     for (const file of valid) {
       try {
-        const record = await queueUpload(file, api.rawUploadUrl);
+        const record = await queueUpload(file, api.rawUploadUrl, {
+          folderId: targetFolder?.id,
+          folderName: targetFolder?.name,
+        });
         queued += 1;
         setUploads((items) => upsertUpload(items, uploadRecordToView(record)));
         if (await startBackgroundFetchUpload(record)) {
@@ -545,19 +565,21 @@ export default function App() {
         }
       } catch (err) {
         notify(err.message || `Could not queue ${file.name}`, "warn");
-        uploadOneLegacy(file);
+        uploadOneLegacy(file, targetFolder);
       }
     }
 
     if (queued > 0) {
       const hasBackgroundSync = await registerBackgroundUpload();
       notify(
-        browserBackground > 0
+        targetFolder
+          ? `${valid.length} files queued in ${targetFolder.name}.`
+          : browserBackground > 0
           ? "Upload handed to the browser background task."
           : hasBackgroundSync
           ? "Upload queued for background retry."
           : "Upload queued. It resumes when this page is open.",
-        browserBackground > 0 || hasBackgroundSync ? "ok" : "info"
+        targetFolder || browserBackground > 0 || hasBackgroundSync ? "ok" : "info"
       );
       if (browserBackground < queued) drainQueuedUploads();
     }
@@ -576,7 +598,7 @@ export default function App() {
     setUploads((items) => items.filter((item) => item.id !== upload.id));
   }
 
-  function uploadOneLegacy(file) {
+  function uploadOneLegacy(file, targetFolder = null) {
     const id = crypto.randomUUID();
     setUploads((items) => [
       ...items,
@@ -591,6 +613,7 @@ export default function App() {
       xhr.setRequestHeader("X-WaterDrop-File-Name", encodeURIComponent(file.name || "unnamed-file"));
       xhr.setRequestHeader("X-WaterDrop-Mime-Type", file.type || "application/octet-stream");
       xhr.setRequestHeader("X-WaterDrop-Upload-Id", id);
+      if (targetFolder?.id) xhr.setRequestHeader("X-WaterDrop-Folder-Id", targetFolder.id);
     }
     xhr.upload.onprogress = (event) => {
       if (!event.lengthComputable) return;
@@ -634,7 +657,7 @@ export default function App() {
     if (window.waterdrop) {
       const result = await window.waterdrop.saveFile(file.id);
       if (result.ok) {
-        notify("Saved to folder", "ok", {
+        notify(isFolderEntry(file) ? "ZIP saved to folder" : "Saved to folder", "ok", {
           label: "Reveal",
           run: () => window.waterdrop.revealPath(result.destination),
         });
@@ -648,8 +671,25 @@ export default function App() {
     window.setTimeout(refreshFiles, 1000);
   }
 
+  async function renameFolder(file) {
+    if (!isFolderEntry(file)) return;
+    const nextName = window.prompt("Folder name", file.name);
+    if (nextName === null) return;
+    const trimmed = nextName.trim();
+    if (!trimmed || trimmed === file.name) return;
+    try {
+      const result = await api.renameFolder(file.id, trimmed);
+      setFiles((items) => items.map((item) => (item.id === file.id ? result.folder : item)));
+      if (previewFile?.id === file.id) setPreviewFile(result.folder);
+      notify("Folder renamed", "ok");
+    } catch (err) {
+      notify(err.message || "Rename failed", "warn");
+    }
+  }
+
   function startExternalDrag(file, event) {
     if (!window.waterdrop?.startFileDrag) return;
+    if (isFolderEntry(file)) return;
     event.preventDefault();
     event.stopPropagation();
     if (event.dataTransfer) {
@@ -816,7 +856,7 @@ export default function App() {
         <main className="work">
           <div className="work-head">
             <div className="shelf-count mono small">
-              <span>{stats.count} files</span>
+              <span>{stats.count} items</span>
               <span className="sep" />
               <span>{formatBytes(stats.totalBytes)}</span>
               <span className="sep" />
@@ -881,9 +921,25 @@ export default function App() {
             onDragLeave={onDragLeave}
             title={uploadModeTitle}
           >
-            <UploadCloud className="dz-icon" size={34} strokeWidth={1.5} />
-            <span className="dz-title">Drop files</span>
+            {createFolderUpload ? (
+              <Folder className="dz-icon" size={34} strokeWidth={1.5} />
+            ) : (
+              <UploadCloud className="dz-icon" size={34} strokeWidth={1.5} />
+            )}
+            <span className="dz-title">{createFolderUpload ? "Drop files into a new folder" : "Drop files"}</span>
           </button>
+
+          <label className="bulk-toggle">
+            <input
+              type="checkbox"
+              checked={createFolderUpload}
+              onChange={(event) => setCreateFolderUpload(event.target.checked)}
+            />
+            <span>
+              <span className="bulk-title">Create Folder</span>
+              <span className="bulk-sub mono small muted">Group the next selection as a ZIP-downloadable folder.</span>
+            </span>
+          </label>
 
           <input ref={fileInputRef} type="file" multiple hidden onChange={onFilesPicked} />
 
@@ -936,6 +992,7 @@ export default function App() {
                   onDelete={() => deleteFile(file)}
                   onDownload={() => downloadFile(file)}
                   onPreview={() => setPreviewFile(file)}
+                  onRename={() => renameFolder(file)}
                   onRequestDelete={() => setConfirmDelete(file.id)}
                   onCancelDelete={() => setConfirmDelete(null)}
                   onStartDrag={(event) => startExternalDrag(file, event)}
@@ -1284,14 +1341,16 @@ function FileCard({
   onDelete,
   onDownload,
   onPreview,
+  onRename,
   onRequestDelete,
   onStartDrag,
 }) {
   const Icon = iconFor(file);
+  const isFolder = isFolderEntry(file);
   const isImage = isImageFile(file);
   const isVideo = isVideoFile(file);
   const isPdf = isPdfFile(file);
-  const title = isDesktop ? "Click to preview. Drag to copy." : "Click to preview.";
+  const title = isFolder ? "Open folder." : isDesktop ? "Click to preview. Drag to copy." : "Click to preview.";
   function onCardKeyDown(event) {
     if (event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
@@ -1301,8 +1360,8 @@ function FileCard({
   return (
     <article
       aria-label={`Preview ${file.name}`}
-      className="file"
-      draggable={isDesktop}
+      className={`file ${isFolder ? "file-folder" : ""}`}
+      draggable={isDesktop && !isFolder}
       onClick={onPreview}
       onDragStart={isDesktop ? onStartDrag : undefined}
       onKeyDown={onCardKeyDown}
@@ -1310,7 +1369,12 @@ function FileCard({
       title={title}
     >
       <div className={`file-tile ${isImage || isVideo || isPdf ? "has-preview" : ""}`}>
-        {isImage ? (
+        {isFolder ? (
+          <>
+            <Folder size={34} strokeWidth={1.35} />
+            <span className="file-badge mono">ZIP</span>
+          </>
+        ) : isImage ? (
           <img className="file-preview-img" src={api.previewUrl(file.id)} alt="" loading="lazy" draggable={false} />
         ) : isVideo ? (
           <>
@@ -1356,7 +1420,8 @@ function FileCard({
           {file.name}
         </div>
         <div className="file-meta mono small">
-          <span>{formatBytes(file.size)}</span>
+          <span>{isFolder ? `${file.itemCount || 0} files` : formatBytes(file.size)}</span>
+          {isFolder && <span>{formatBytes(file.size)}</span>}
           <span>
             <Clock3 size={12} /> {timeLeft(file.expiresAt)}
           </span>
@@ -1364,17 +1429,31 @@ function FileCard({
             <Download size={12} /> {file.downloads || 0}
           </span>
         </div>
-        <button
-          className="file-sha mono small"
-          onClick={(event) => {
-            event.stopPropagation();
-            onCopyHash();
-          }}
-          onKeyDown={(event) => event.stopPropagation()}
-          title={file.sha256}
-        >
-          <Info size={12} /> {shortHash(file.sha256)}
-        </button>
+        {isFolder ? (
+          <button
+            className="file-sha mono small"
+            onClick={(event) => {
+              event.stopPropagation();
+              onRename?.();
+            }}
+            onKeyDown={(event) => event.stopPropagation()}
+            title="Rename folder"
+          >
+            <Pencil size={12} /> Rename
+          </button>
+        ) : (
+          <button
+            className="file-sha mono small"
+            onClick={(event) => {
+              event.stopPropagation();
+              onCopyHash();
+            }}
+            onKeyDown={(event) => event.stopPropagation()}
+            title={file.sha256}
+          >
+            <Info size={12} /> {shortHash(file.sha256)}
+          </button>
+        )}
       </div>
       <div
         className="file-actions"
@@ -1411,7 +1490,7 @@ function FileCard({
 
 function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onDownload }) {
   const kind = previewKindFor(file);
-  const previewUrl = api.previewUrl(file.id);
+  const previewUrl = kind === "folder" ? "" : api.previewUrl(file.id);
   const [contextMenu, setContextMenu] = useState(null);
   const [closing, setClosing] = useState(false);
   const closeTimer = useRef(null);
@@ -1482,7 +1561,7 @@ function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onDownload }
             </div>
             <div className="preview-meta mono small">
               <span>{formatBytes(file.size)}</span>
-              <span>{file.mimeType || "application/octet-stream"}</span>
+              <span>{kind === "folder" ? `${file.itemCount || 0} files` : file.mimeType || "application/octet-stream"}</span>
               <span>{timeLeft(file.expiresAt)}</span>
             </div>
           </div>
@@ -1492,6 +1571,7 @@ function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onDownload }
         </header>
 
         <div className={`preview-body preview-${kind}`}>
+          {kind === "folder" && <FolderPreview file={file} />}
           {kind === "image" && (
             <img
               className="preview-media"
@@ -1530,9 +1610,11 @@ function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onDownload }
             {isDesktop ? <HardDriveDownload size={14} /> : <Download size={14} />}
             {isDesktop ? "Save" : "Get"}
           </button>
-          <a className="btn btn-ghost btn-sm" href={previewUrl} target="_blank" rel="noreferrer">
-            <ExternalLink size={14} /> Open
-          </a>
+          {kind !== "folder" && (
+            <a className="btn btn-ghost btn-sm" href={previewUrl} target="_blank" rel="noreferrer">
+              <ExternalLink size={14} /> Open
+            </a>
+          )}
         </footer>
       </section>
       {contextMenu && (
@@ -1586,6 +1668,34 @@ function TextPreview({ file, url }) {
     return <div className="preview-empty">Could not load preview.</div>;
   }
   return <pre className="preview-text">{state.text || " "}</pre>;
+}
+
+function FolderPreview({ file }) {
+  const files = Array.isArray(file.files) ? file.files : [];
+  if (!files.length) {
+    return (
+      <div className="preview-empty">
+        <Folder size={42} strokeWidth={1.35} />
+        <span>This folder is empty.</span>
+      </div>
+    );
+  }
+  return (
+    <div className="folder-preview-list">
+      {files.map((child) => {
+        const Icon = iconFor(child);
+        return (
+          <div className="folder-preview-row" key={child.id}>
+            <Icon size={16} strokeWidth={1.5} />
+            <span className="folder-preview-name" title={child.name}>
+              {child.name}
+            </span>
+            <span className="mono small muted">{formatBytes(child.size)}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 async function request(url, options = {}) {
@@ -1670,6 +1780,7 @@ async function uploadQueuedRecord({
       xhr.setRequestHeader("X-WaterDrop-File-Name", encodeURIComponent(record.name || "unnamed-file"));
       xhr.setRequestHeader("X-WaterDrop-Mime-Type", record.mimeType || "application/octet-stream");
       xhr.setRequestHeader("X-WaterDrop-Upload-Id", record.id);
+      if (record.folderId) xhr.setRequestHeader("X-WaterDrop-Folder-Id", record.folderId);
       xhr.upload.onprogress = (event) => {
         markActivity();
         if (!event.lengthComputable) return;
@@ -1736,6 +1847,7 @@ function isWaterDropDrag(event) {
 }
 
 function iconFor(file) {
+  if (isFolderEntry(file)) return Folder;
   const type = String(file.mimeType || "");
   const name = String(file.name || "").toLowerCase();
   if (type.startsWith("image/")) return FileImage;
@@ -1749,25 +1861,34 @@ function iconFor(file) {
   return MoreHorizontal;
 }
 
+function isFolderEntry(file) {
+  return file?.kind === "folder";
+}
+
 function isImageFile(file) {
+  if (isFolderEntry(file)) return false;
   return String(file.mimeType || "").startsWith("image/");
 }
 
 function isVideoFile(file) {
+  if (isFolderEntry(file)) return false;
   return String(file.mimeType || "").startsWith("video/");
 }
 
 function isAudioFile(file) {
+  if (isFolderEntry(file)) return false;
   return String(file.mimeType || "").startsWith("audio/");
 }
 
 function isPdfFile(file) {
+  if (isFolderEntry(file)) return false;
   const type = String(file.mimeType || "").toLowerCase();
   const name = String(file.name || "").toLowerCase();
   return type === "application/pdf" || name.endsWith(".pdf");
 }
 
 function isTextFile(file) {
+  if (isFolderEntry(file)) return false;
   const type = String(file.mimeType || "").toLowerCase();
   const name = String(file.name || "").toLowerCase();
   return (
@@ -1778,6 +1899,7 @@ function isTextFile(file) {
 }
 
 function previewKindFor(file) {
+  if (isFolderEntry(file)) return "folder";
   if (isImageFile(file)) return "image";
   if (isVideoFile(file)) return "video";
   if (isAudioFile(file)) return "audio";

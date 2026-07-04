@@ -12,7 +12,7 @@ export function isUploadQueueSupported() {
   return typeof indexedDB !== "undefined" && typeof Blob !== "undefined";
 }
 
-export async function queueUpload(file, uploadUrl) {
+export async function queueUpload(file, uploadUrl, options = {}) {
   if (!isUploadQueueSupported()) throw new Error("Upload queue is not available");
   const now = Date.now();
   const record = {
@@ -30,6 +30,8 @@ export async function queueUpload(file, uploadUrl) {
     lockedUntil: 0,
     lastError: "",
   };
+  if (options.folderId) record.folderId = options.folderId;
+  if (options.folderName) record.folderName = options.folderName;
   await putUploadRecord(record);
   return record;
 }
@@ -151,6 +153,7 @@ export async function requestBackgroundFetchUpload(registration, record) {
       "X-WaterDrop-File-Name": encodeURIComponent(record.name || "unnamed-file"),
       "X-WaterDrop-Mime-Type": record.mimeType || "application/octet-stream",
       "X-WaterDrop-Upload-Id": record.id,
+      ...(record.folderId ? { "X-WaterDrop-Folder-Id": record.folderId } : {}),
     },
   });
 
@@ -182,6 +185,8 @@ export function uploadRecordToView(record) {
     status: record.status || "queued",
     attempts: Number(record.attempts || 0),
     createdAt: Number(record.createdAt || 0),
+    folderId: record.folderId || "",
+    folderName: record.folderName || "",
     queued: true,
   };
 }
