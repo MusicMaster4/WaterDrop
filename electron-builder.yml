@@ -1,5 +1,5 @@
 appId: dev.jubarte.waterdrop
-productName: Water Drop
+productName: WaterDrop
 directories:
   output: release
 files:
@@ -13,7 +13,7 @@ win:
   target:
     - nsis
   icon: assets/icon.ico
-  artifactName: Water-Drop-${version}-Setup.${ext}
+  artifactName: WaterDrop-${version}-Setup.${ext}
 nsis:
   oneClick: false
   perMachine: false

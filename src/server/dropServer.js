@@ -223,7 +223,7 @@ async function createDropServer({ dataDir, defaultDownloadDir, rendererDir, port
 
 async function handleRequest({ req, res, store, rendererDir, getPort }) {
   if (!isAllowedRemote(req.socket.remoteAddress)) {
-    sendJson(res, 403, { error: "Water Drop only accepts loopback or Tailscale clients." });
+    sendJson(res, 403, { error: "WaterDrop only accepts loopback or Tailscale clients." });
     return;
   }
 
@@ -277,7 +277,7 @@ async function handleApi({ req, res, relative, store, getPort }) {
       color: { dark: "#08080a", light: "#ffffff" },
     });
     sendJson(res, 200, {
-      name: "Water Drop",
+      name: "WaterDrop",
       basePath: BASE_PATH,
       retentionDays: 7,
       network,
@@ -439,7 +439,7 @@ async function handleDownload(req, res, store, id) {
     "Content-Disposition": `attachment; filename="${asciiFileName(file.name)}"; filename*=UTF-8''${encodedName}`,
     "Content-Type": file.mimeType || "application/octet-stream",
     "X-Content-Type-Options": "nosniff",
-    "X-Water-Drop-SHA256": file.sha256,
+    "X-WaterDrop-SHA256": file.sha256,
   };
 
   if (range && range.invalid) {
@@ -495,7 +495,7 @@ async function handlePreview(req, res, store, id) {
     "Content-Disposition": `inline; filename="${asciiFileName(file.name)}"`,
     "Content-Type": file.mimeType || mime.lookup(file.name) || "application/octet-stream",
     "X-Content-Type-Options": "nosniff",
-    "X-Water-Drop-SHA256": file.sha256,
+    "X-WaterDrop-SHA256": file.sha256,
   };
 
   if (range && range.invalid) {
@@ -615,7 +615,7 @@ async function listenWithFallback(server, preferredPort) {
       if (err.code !== "EADDRINUSE") throw err;
     }
   }
-  throw new Error("Could not find an open port for Water Drop.");
+  throw new Error("Could not find an open port for WaterDrop.");
 }
 
 function isAllowedRemote(remoteAddress) {
@@ -670,7 +670,7 @@ function corsHeaders() {
     "Access-Control-Allow-Headers": "Content-Type, Range",
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Expose-Headers": "Content-Disposition, Content-Length, Content-Range, X-Water-Drop-SHA256",
+    "Access-Control-Expose-Headers": "Content-Disposition, Content-Length, Content-Range, X-WaterDrop-SHA256",
   };
 }
 
@@ -688,7 +688,7 @@ async function readJson(filePath, fallback) {
 }
 
 async function writeJsonAtomic(filePath, value) {
-  const tmpPath = `${filePath}.${process.pid}.tmp`;
+  const tmpPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
   await fsp.mkdir(path.dirname(filePath), { recursive: true });
   await fsp.writeFile(tmpPath, `${JSON.stringify(value, null, 2)}\n`);
   await fsp.rename(tmpPath, filePath);

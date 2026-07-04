@@ -91,6 +91,10 @@ function isValidFileId(id) {
   return typeof id === "string" && /^[0-9a-f-]{36}$/i.test(id);
 }
 
+function isImageEntry(file) {
+  return String(file?.mimeType || "").toLowerCase().startsWith("image/");
+}
+
 function shouldStartHidden() {
   return process.argv.includes("--hidden") || process.argv.includes("--background");
 }
@@ -131,7 +135,7 @@ async function createWindow() {
     minWidth: 920,
     minHeight: 620,
     backgroundColor: "#08080a",
-    title: "Water Drop",
+    title: "WaterDrop",
     show: !shouldStartHidden(),
     icon: appIcon(),
     webPreferences: {
@@ -173,10 +177,10 @@ function createTray() {
     logDiagnostic("tray creation failed", err);
     return;
   }
-  tray.setToolTip("Water Drop");
+  tray.setToolTip("WaterDrop");
   tray.setContextMenu(
     Menu.buildFromTemplate([
-      { label: "Open Water Drop", click: showMainWindow },
+      { label: "Open WaterDrop", click: showMainWindow },
       { type: "separator" },
       {
         label: "Quit",
@@ -288,6 +292,21 @@ function wireIpc() {
     return { ok: true };
   });
 
+  ipcMain.handle("waterdrop:copy-image", async (_event, id) => {
+    try {
+      if (!isValidFileId(id)) return { ok: false, message: "Invalid file id" };
+      const file = dropServer.store.get(id);
+      if (!file) return { ok: false, message: "File not found" };
+      if (!isImageEntry(file)) return { ok: false, message: "Only images can be copied" };
+      const image = nativeImage.createFromPath(dropServer.store.pathFor(file));
+      if (image.isEmpty()) return { ok: false, message: "Could not read image" };
+      clipboard.writeImage(image);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, message: err.message || "Copy failed" };
+    }
+  });
+
   ipcMain.handle("waterdrop:configure-serve", async () => tailscale.configureServe(dropServer.port));
 }
 
@@ -314,7 +333,7 @@ if (gotLock) {
     } catch (err) {
       logDiagnostic("startup failed", err);
       dialog.showErrorBox(
-        "Water Drop could not start",
+        "WaterDrop could not start",
         `${(err && err.message) || err}\n\nDetails were written to:\n${path.join(
           app.getPath("userData"),
           "waterdrop-main.log"

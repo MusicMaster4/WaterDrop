@@ -13,7 +13,7 @@ test("uploads, lists, previews, downloads, deletes, and clears files", async () 
   const dataDir = path.join(root, "data");
   const downloads = path.join(root, "downloads");
   await fs.mkdir(rendererDir, { recursive: true });
-  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>Water Drop</title>");
+  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>WaterDrop</title>");
 
   const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 47950 });
   try {

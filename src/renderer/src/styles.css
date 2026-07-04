@@ -1,5 +1,5 @@
 /* ============================================================
-   Water Drop -- renderer
+   WaterDrop -- renderer
    "Chapa Noir" palette: true black, warm ivory ink, thin engraved
    borders, subtle grain. One responsive surface serves the Electron
    desktop (wide) and the phone browser (narrow). Every animation is
@@ -470,6 +470,47 @@ body::before {
   color: var(--text);
 }
 
+.status-line {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 9px 11px;
+  color: var(--muted);
+  animation: riseFade 240ms var(--ease) both;
+}
+.status-line.is-ok {
+  border-color: rgba(143, 184, 154, 0.32);
+  color: var(--text);
+}
+.status-line.is-warn {
+  border-color: rgba(207, 122, 107, 0.34);
+  color: var(--text);
+}
+.status-line span:nth-child(2) {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.status-action {
+  flex: none;
+  background: none;
+  border: none;
+  color: var(--silver);
+  cursor: pointer;
+  font: 700 0.68rem var(--sans);
+  letter-spacing: 0.1em;
+  padding: 0;
+  text-transform: uppercase;
+}
+.status-action:hover {
+  color: var(--ink);
+}
+
 /* ---- Dropzone -- big upload affordance ---- */
 .dropzone {
   display: flex;
@@ -858,55 +899,33 @@ body::before {
   text-align: center;
 }
 
-/* ---- Toasts ---- */
-.toasts {
+.context-menu {
   position: fixed;
-  left: 50%;
-  bottom: calc(18px + env(safe-area-inset-bottom));
-  transform: translateX(-50%);
-  z-index: 400;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  width: min(440px, calc(100% - 28px));
-  pointer-events: none;
+  z-index: 460;
+  min-width: 178px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--panel-solid);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.62);
+  padding: 5px;
+  animation: riseFade 120ms var(--ease) both;
 }
-.toast {
-  pointer-events: auto;
+.context-menu-item {
+  width: 100%;
   display: flex;
   align-items: center;
-  gap: 10px;
-  background: var(--panel-solid);
-  border: 1px solid var(--line-strong);
-  border-radius: 10px;
-  padding: 10px 12px;
-  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.55);
-  animation: toastIn 260ms var(--ease) both;
-}
-.toast .dot {
-  margin-top: 1px;
-}
-.toast-text {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 0.84rem;
+  gap: 8px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
   color: var(--text);
-}
-.toast-action {
-  flex: none;
-  background: none;
-  border: none;
-  padding: 0;
-  color: var(--silver);
-  font: 600 0.72rem var(--sans);
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
   cursor: pointer;
+  font: 600 0.82rem var(--sans);
+  padding: 8px 9px;
+  text-align: left;
 }
-.toast-action:hover {
+.context-menu-item:hover {
+  background: var(--panel-strong);
   color: var(--ink);
 }
 
@@ -931,17 +950,6 @@ body::before {
     transform: none;
   }
 }
-@keyframes toastIn {
-  from {
-    opacity: 0;
-    transform: translateY(10px) scale(0.98);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-
 /* ============================================================
    DESKTOP -- landscape two-column command surface
    ============================================================ */
@@ -1051,67 +1059,31 @@ body::before {
   border-top: 1px solid var(--line);
 }
 
-.update-banner {
-  position: fixed;
-  left: 50%;
-  top: calc(16px + env(safe-area-inset-top));
-  transform: translateX(-50%);
-  z-index: 420;
+.update-inline {
   display: flex;
   align-items: center;
-  gap: 12px;
-  width: min(560px, calc(100% - 28px));
-  background: var(--panel-solid);
-  border: 1px solid var(--line-strong);
-  border-radius: 12px;
-  padding: 12px 14px;
-  box-shadow: 0 16px 44px rgba(0, 0, 0, 0.6);
-  animation: toastIn 300ms var(--ease) both;
+  gap: 9px;
+  min-height: 28px;
+  margin-top: 8px;
 }
-.update-banner-mark {
-  display: grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  flex: none;
-  border-radius: 9px;
-  color: var(--ink);
-  background: var(--panel-strong);
-  border: 1px solid var(--line);
-}
-.update-banner-body {
+.update-inline > span:first-child {
   flex: 1;
   min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
 }
-.update-banner-title {
-  color: var(--ink);
-  font-weight: 600;
+.update-inline .btn {
+  margin-left: auto;
 }
-.update-banner-sub {
-  color: var(--muted);
-}
-.update-banner-bar {
-  display: block;
+.update-progress {
+  flex: 1;
   height: 5px;
-  width: 100%;
-  margin-top: 4px;
   border-radius: 99px;
   background: var(--panel-strong);
   overflow: hidden;
 }
-.update-banner-fill {
+.update-progress span {
   display: block;
   height: 100%;
-  border-radius: 99px;
+  border-radius: inherit;
   background: var(--ink);
   transition: width 200ms var(--ease);
-}
-.update-banner-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: none;
 }

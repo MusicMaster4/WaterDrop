@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld("waterdrop", {
   revealPath: (filePath) => ipcRenderer.invoke("waterdrop:reveal-path", filePath),
   openExternal: (url) => ipcRenderer.invoke("waterdrop:open-external", url),
   copyText: (text) => ipcRenderer.invoke("waterdrop:copy-text", text),
+  copyImage: (id) => ipcRenderer.invoke("waterdrop:copy-image", id),
   configureServe: () => ipcRenderer.invoke("waterdrop:configure-serve"),
 
   // Auto-update bridge.

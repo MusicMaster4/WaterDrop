@@ -1,5 +1,4 @@
 import {
-  ArrowUpCircle,
   Check,
   ChevronDown,
   Clock3,
@@ -59,6 +58,7 @@ export default function App() {
   const isDesktop = Boolean(window.waterdrop);
   const fileInputRef = useRef(null);
   const dragDepth = useRef(0);
+  const noticeTimeoutRef = useRef(null);
   const [api, setApi] = useState(apiDefault);
   const [appInfo, setAppInfo] = useState(null);
   const [info, setInfo] = useState(null);
@@ -68,19 +68,24 @@ export default function App() {
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(true);
   const [qrOpen, setQrOpen] = useState(false);
-  const [toasts, setToasts] = useState([]);
+  const [notice, setNotice] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [confirmClear, setConfirmClear] = useState(false);
   const [previewFile, setPreviewFile] = useState(null);
   const [update, setUpdate] = useState(null);
-  const [updateDismissed, setUpdateDismissed] = useState(false);
 
-  const toast = useCallback((message, kind = "info", action) => {
-    const id = crypto.randomUUID();
-    setToasts((items) => [...items, { id, message, kind, action }].slice(-3));
-    window.setTimeout(() => {
-      setToasts((items) => items.filter((item) => item.id !== id));
-    }, 3600);
+  const notify = useCallback((message, kind = "info", action) => {
+    if (!message) return;
+    if (noticeTimeoutRef.current) window.clearTimeout(noticeTimeoutRef.current);
+    setNotice({ id: crypto.randomUUID(), message, kind, action });
+    noticeTimeoutRef.current = window.setTimeout(() => {
+      setNotice(null);
+      noticeTimeoutRef.current = null;
+    }, 4800);
+  }, []);
+
+  useEffect(() => () => {
+    if (noticeTimeoutRef.current) window.clearTimeout(noticeTimeoutRef.current);
   }, []);
 
   const refreshFiles = useCallback(async ({ silent = false } = {}) => {
@@ -89,18 +94,18 @@ export default function App() {
       setFiles(result.files || []);
       setSettings(result.settings || {});
     } catch (err) {
-      if (!silent) toast(err.message || "Could not refresh files", "warn");
+      if (!silent) notify(err.message || "Could not refresh files", "warn");
     }
-  }, [api, toast]);
+  }, [api, notify]);
 
   const refreshInfo = useCallback(async ({ silent = false } = {}) => {
     try {
       const result = await api.getInfo();
       setInfo(result);
     } catch (err) {
-      if (!silent) toast(err.message || "Could not refresh network", "warn");
+      if (!silent) notify(err.message || "Could not refresh network", "warn");
     }
-  }, [api, toast]);
+  }, [api, notify]);
 
   useEffect(() => {
     let mounted = true;
@@ -114,7 +119,7 @@ export default function App() {
           setApi(buildApi(desktopInfo.server.localUrl));
         }
       } catch (err) {
-        toast(err.message || "Desktop bridge failed", "warn");
+        notify(err.message || "Desktop bridge failed", "warn");
       } finally {
         if (mounted) setBusy(false);
       }
@@ -123,7 +128,7 @@ export default function App() {
     return () => {
       mounted = false;
     };
-  }, [isDesktop, toast]);
+  }, [isDesktop, notify]);
 
   useEffect(() => {
     if (busy) return;
@@ -172,9 +177,6 @@ export default function App() {
     const unsubscribe = window.waterdrop.update.onStatus((status) => {
       if (!active) return;
       setUpdate(status);
-      if (status?.state === "available" || status?.state === "downloaded") {
-        setUpdateDismissed(false);
-      }
     });
     return () => {
       active = false;
@@ -186,15 +188,13 @@ export default function App() {
     if (!window.waterdrop?.update) return;
     const status = await window.waterdrop.update.check({ silent: false });
     setUpdate(status);
-    if (status?.state === "up-to-date") toast("You're on the latest version", "ok");
-    if (status?.state === "dev") toast("Updates run only in the installed app", "info");
-  }, [toast]);
+  }, []);
 
   const downloadUpdate = useCallback(async () => {
     if (!window.waterdrop?.update) return;
     const result = await window.waterdrop.update.download();
-    if (!result.ok) toast(result.message || "Download failed", "warn");
-  }, [toast]);
+    if (!result.ok) setUpdate({ state: "error", message: result.message || "Download failed" });
+  }, []);
 
   const installUpdate = useCallback(async () => {
     if (!window.waterdrop?.update) return;
@@ -220,9 +220,9 @@ export default function App() {
       } else {
         await navigator.clipboard.writeText(text);
       }
-      toast(label, "ok");
+      notify(label, "ok");
     } catch {
-      toast("Copy failed", "warn");
+      notify("Copy failed", "warn");
     }
   }
 
@@ -232,10 +232,10 @@ export default function App() {
         ? await window.waterdrop.configureServe()
         : await api.configureServe();
       if (!result.ok) throw new Error(result.message || "Serve failed");
-      toast("/drop published", "ok");
+      notify("/drop published", "ok");
       await refreshInfo();
     } catch (err) {
-      toast(err.message || "Could not publish /drop", "warn");
+      notify(err.message || "Could not publish /drop", "warn");
     }
   }
 
@@ -244,7 +244,7 @@ export default function App() {
     const result = await window.waterdrop.chooseDownloadDir();
     if (result.ok) {
       setSettings((current) => ({ ...current, downloadDir: result.downloadDir }));
-      toast("Folder saved", "ok");
+      notify("Folder saved", "ok");
     }
   }
 
@@ -253,9 +253,9 @@ export default function App() {
     const result = await window.waterdrop.setSettings(patch);
     if (result.ok) {
       setSettings(result.settings || {});
-      toast("Setting saved", "ok");
+      notify("Setting saved", "ok");
     } else {
-      toast(result.message || "Setting failed", "warn");
+      notify(result.message || "Setting failed", "warn");
     }
   }
 
@@ -328,14 +328,14 @@ export default function App() {
         setUploads((items) =>
           items.map((item) => (item.id === id ? { ...item, status: "error" } : item))
         );
-        toast(`Upload failed: ${file.name}`, "warn");
+        notify(`Upload failed: ${file.name}`, "warn");
       }
     };
     xhr.onerror = () => {
       setUploads((items) =>
         items.map((item) => (item.id === id ? { ...item, status: "error" } : item))
       );
-      toast(`Upload failed: ${file.name}`, "warn");
+      notify(`Upload failed: ${file.name}`, "warn");
     };
     xhr.send(data);
   }
@@ -344,14 +344,14 @@ export default function App() {
     if (window.waterdrop) {
       const result = await window.waterdrop.saveFile(file.id);
       if (result.ok) {
-        toast("Saved to folder", "ok", {
+        notify("Saved to folder", "ok", {
           label: "Reveal",
           run: () => window.waterdrop.revealPath(result.destination),
         });
         await refreshFiles();
         return;
       }
-      toast(result.message || "Save failed", "warn");
+      notify(result.message || "Save failed", "warn");
       return;
     }
     window.location.href = api.downloadUrl(file.id);
@@ -376,10 +376,10 @@ export default function App() {
       setConfirmClear(false);
       setConfirmDelete(null);
       setPreviewFile(null);
-      toast(`Cleared ${result.deleted || 0} files`, "ok");
+      notify(`Cleared ${result.deleted || 0} files`, "ok");
       await refreshFiles();
     } catch (err) {
-      toast(err.message || "Clear failed", "warn");
+      notify(err.message || "Clear failed", "warn");
     }
   }
 
@@ -387,10 +387,29 @@ export default function App() {
     try {
       await api.deleteFile(file.id);
       setConfirmDelete(null);
-      toast("Deleted", "ok");
+      notify("Deleted", "ok");
       await refreshFiles();
     } catch (err) {
-      toast(err.message || "Delete failed", "warn");
+      notify(err.message || "Delete failed", "warn");
+    }
+  }
+
+  async function copyImage(file) {
+    if (!file) return { ok: false, message: "No image selected" };
+    if (window.waterdrop?.copyImage) {
+      const result = await window.waterdrop.copyImage(file.id);
+      if (!result.ok) notify(result.message || "Copy failed", "warn");
+      return result;
+    }
+    try {
+      const response = await fetch(api.previewUrl(file.id));
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const blob = await response.blob();
+      await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+      return { ok: true };
+    } catch (err) {
+      notify(err.message || "Copy failed", "warn");
+      return { ok: false, message: err.message || "Copy failed" };
     }
   }
 
@@ -469,15 +488,16 @@ export default function App() {
               <div className="update-row">
                 <span className="mono small muted">
                   v{update?.currentVersion || appInfo?.version || "?"}
-                  {update?.state === "downloading" && ` · downloading ${update.percent || 0}%`}
-                  {update?.state === "available" && ` · v${update.version} ready to download`}
-                  {update?.state === "downloaded" && ` · v${update.version} ready to install`}
-                  {update?.state === "checking" && " · checking…"}
                 </span>
                 <button className="btn btn-ghost btn-xs" onClick={checkForUpdate}>
                   <RefreshCw size={13} /> Check updates
                 </button>
               </div>
+              <UpdateInline
+                update={update}
+                onDownload={downloadUpdate}
+                onInstall={installUpdate}
+              />
             </div>
           )}
 
@@ -521,6 +541,18 @@ export default function App() {
               </button>
             </div>
           </div>
+
+          {notice && (
+            <div className={`status-line ${notice.kind === "warn" ? "is-warn" : notice.kind === "ok" ? "is-ok" : ""}`}>
+              <span className={`dot ${notice.kind === "ok" ? "dot-ok" : notice.kind === "warn" ? "dot-warn" : "dot-idle"}`} />
+              <span>{notice.message}</span>
+              {notice.action && (
+                <button className="status-action" onClick={notice.action.run}>
+                  {notice.action.label}
+                </button>
+              )}
+            </div>
+          )}
 
           {isDesktop && (
             <div className="folder-row only-desktop">
@@ -605,87 +637,50 @@ export default function App() {
           file={previewFile}
           isDesktop={isDesktop}
           onClose={() => setPreviewFile(null)}
+          onCopyImage={() => copyImage(previewFile)}
           onDownload={() => downloadFile(previewFile)}
         />
       )}
 
-      {isDesktop && (
-        <UpdateBanner
-          update={update}
-          dismissed={updateDismissed}
-          onDownload={downloadUpdate}
-          onInstall={installUpdate}
-          onDismiss={() => setUpdateDismissed(true)}
-        />
-      )}
-
-      <div className="toasts">
-        {toasts.map((item) => (
-          <div className="toast" key={item.id}>
-            <span className={`dot ${item.kind === "ok" ? "dot-ok" : item.kind === "warn" ? "dot-warn" : "dot-idle"}`} />
-            <span className="toast-text">{item.message}</span>
-            {item.action && (
-              <button className="toast-action" onClick={item.action.run}>
-                {item.action.label}
-              </button>
-            )}
-          </div>
-        ))}
-      </div>
     </>
   );
 }
 
-function UpdateBanner({ update, dismissed, onDownload, onInstall, onDismiss }) {
-  if (!update || dismissed) return null;
+function UpdateInline({ update, onDownload, onInstall }) {
+  if (!update) return null;
   const { state } = update;
-  if (state !== "available" && state !== "downloading" && state !== "downloaded") return null;
+  if (state === "idle") return null;
 
   return (
-    <div className="update-banner" role="status">
-      <span className="update-banner-mark" aria-hidden="true">
-        <ArrowUpCircle size={20} strokeWidth={1.7} />
-      </span>
-      <div className="update-banner-body">
-        {state === "available" && (
-          <>
-            <span className="update-banner-title">Version {update.version} is available</span>
-            <span className="update-banner-sub mono small">Your files and settings are kept.</span>
-          </>
-        )}
-        {state === "downloading" && (
-          <>
-            <span className="update-banner-title">Downloading v{update.version || ""}…</span>
-            <span className="update-banner-bar">
-              <span className="update-banner-fill" style={{ width: `${update.percent || 0}%` }} />
-            </span>
-          </>
-        )}
-        {state === "downloaded" && (
-          <>
-            <span className="update-banner-title">Version {update.version} is ready</span>
-            <span className="update-banner-sub mono small">Restart to finish installing.</span>
-          </>
-        )}
-      </div>
-      <div className="update-banner-actions">
-        {state === "available" && (
-          <button className="btn btn-solid btn-sm" onClick={onDownload}>
-            <Download size={14} /> Download
+    <div className={`update-inline ${state === "error" ? "is-error" : ""}`} role="status">
+      {state === "checking" && <span className="mono small muted">Checking for updates...</span>}
+      {state === "up-to-date" && <span className="mono small muted">You're on the latest version.</span>}
+      {state === "dev" && <span className="mono small muted">Updates run only in the installed app.</span>}
+      {state === "error" && <span className="mono small danger">{update.message || "Update check failed."}</span>}
+      {state === "available" && (
+        <>
+          <span className="mono small muted">Version {update.version} is available.</span>
+          <button className="btn btn-solid btn-xs" onClick={onDownload}>
+            <Download size={13} /> Download &amp; Update
           </button>
-        )}
-        {state === "downloading" && (
+        </>
+      )}
+      {state === "downloading" && (
+        <>
+          <div className="update-progress" aria-label={`Downloading ${update.percent || 0}%`}>
+            <span style={{ width: `${update.percent || 0}%` }} />
+          </div>
           <span className="mono small muted">{update.percent || 0}%</span>
-        )}
-        {state === "downloaded" && (
-          <button className="btn btn-solid btn-sm" onClick={onInstall}>
-            <RefreshCw size={14} /> Install &amp; Restart
+        </>
+      )}
+      {state === "downloaded" && (
+        <>
+          <span className="mono small muted">Version {update.version || ""} is ready.</span>
+          <button className="btn btn-solid btn-xs" onClick={onInstall}>
+            <RefreshCw size={13} /> Install &amp; Restart
           </button>
-        )}
-        <button className="icon-btn" title="Dismiss" onClick={onDismiss}>
-          <X size={16} />
-        </button>
-      </div>
+        </>
+      )}
     </div>
   );
 }
@@ -825,17 +820,51 @@ function FileCard({
   );
 }
 
-function PreviewModal({ api, file, isDesktop, onClose, onDownload }) {
+function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onDownload }) {
   const kind = previewKindFor(file);
   const previewUrl = api.previewUrl(file.id);
+  const [contextMenu, setContextMenu] = useState(null);
+
+  const copyImageFromPreview = useCallback(async () => {
+    if (kind !== "image") return;
+    setContextMenu((menu) => (menu ? { ...menu, busy: true } : menu));
+    const result = await onCopyImage?.();
+    if (result?.ok) {
+      setContextMenu((menu) => (menu ? { ...menu, busy: false, copied: true } : menu));
+      window.setTimeout(() => setContextMenu(null), 650);
+      return;
+    }
+    setContextMenu((menu) => (menu ? { ...menu, busy: false } : menu));
+  }, [kind, onCopyImage]);
 
   useEffect(() => {
     const onKeyDown = (event) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") {
+        if (contextMenu) {
+          setContextMenu(null);
+          return;
+        }
+        onClose();
+      }
+      if (kind === "image" && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") {
+        event.preventDefault();
+        copyImageFromPreview();
+      }
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
+  }, [contextMenu, copyImageFromPreview, kind, onClose]);
+
+  useEffect(() => {
+    if (!contextMenu) return undefined;
+    const closeContextMenu = () => setContextMenu(null);
+    document.addEventListener("click", closeContextMenu);
+    window.addEventListener("blur", closeContextMenu);
+    return () => {
+      document.removeEventListener("click", closeContextMenu);
+      window.removeEventListener("blur", closeContextMenu);
+    };
+  }, [contextMenu]);
 
   return (
     <div
@@ -862,7 +891,22 @@ function PreviewModal({ api, file, isDesktop, onClose, onDownload }) {
         </header>
 
         <div className={`preview-body preview-${kind}`}>
-          {kind === "image" && <img className="preview-media" src={previewUrl} alt={file.name} />}
+          {kind === "image" && (
+            <img
+              className="preview-media"
+              src={previewUrl}
+              alt={file.name}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                setContextMenu({
+                  x: Math.min(event.clientX, window.innerWidth - 190),
+                  y: Math.min(event.clientY, window.innerHeight - 56),
+                  busy: false,
+                  copied: false,
+                });
+              }}
+            />
+          )}
           {kind === "video" && <video className="preview-media" src={previewUrl} controls autoPlay={false} />}
           {kind === "audio" && (
             <div className="preview-audio-wrap">
@@ -890,6 +934,19 @@ function PreviewModal({ api, file, isDesktop, onClose, onDownload }) {
           </a>
         </footer>
       </section>
+      {contextMenu && (
+        <div
+          className="context-menu"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onMouseDown={(event) => event.stopPropagation()}
+          role="menu"
+        >
+          <button className="context-menu-item" onClick={copyImageFromPreview} role="menuitem">
+            <Copy size={14} />
+            {contextMenu.copied ? "Copied" : contextMenu.busy ? "Copying..." : "Copy image"}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

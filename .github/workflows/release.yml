@@ -120,7 +120,7 @@ jobs:
           fi
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --draft --title "Water Drop $TAG" --generate-notes
+              --draft --title "WaterDrop $TAG" --generate-notes
           fi
 
   build:
@@ -159,7 +159,7 @@ jobs:
         if: needs.version.outputs.publish != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: water-drop-windows
+          name: waterdrop-windows
           path: |
             release/*.exe
             release/*.yml

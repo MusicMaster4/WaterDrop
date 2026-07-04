@@ -1,6 +1,6 @@
-# Water Drop Plan
+# WaterDrop Plan
 
-Water Drop is a private file shelf for a Tailnet. The desktop app starts a local HTTP server, serves a responsive file explorer at `/drop/`, and lets phones or computers upload/download files without transcoding or quality changes.
+WaterDrop is a private file shelf for a Tailnet. The desktop app starts a local HTTP server, serves a responsive file explorer at `/drop/`, and lets phones or computers upload/download files without transcoding or quality changes.
 
 ## Architecture
 

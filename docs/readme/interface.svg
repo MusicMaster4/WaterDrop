@@ -1,4 +1,4 @@
-<svg width="960" height="600" viewBox="0 0 960 600" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Water Drop interface preview">
+<svg width="960" height="600" viewBox="0 0 960 600" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="WaterDrop interface preview">
   <defs>
     <linearGradient id="win" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#0d0d10"/>
@@ -17,7 +17,7 @@
     <circle cx="34" cy="34" r="6" fill="#cf7a6b"/>
     <circle cx="54" cy="34" r="6" fill="#c9a86b"/>
     <circle cx="74" cy="34" r="6" fill="#8fb89a"/>
-    <text x="470" y="39" text-anchor="middle" font-family="Segoe UI, sans-serif" font-size="13" fill="#878b91">Water Drop</text>
+    <text x="470" y="39" text-anchor="middle" font-family="Segoe UI, sans-serif" font-size="13" fill="#878b91">WaterDrop</text>
   </g>
   <line x1="8" y1="60" x2="952" y2="60" stroke="rgba(247,248,250,0.08)"/>
 
@@ -38,7 +38,7 @@
     <!-- brand -->
     <g transform="translate(20,24)">
       <rect width="34" height="34" rx="9" fill="url(#dropg)"/>
-      <text x="46" y="16" font-family="Arial Black, sans-serif" font-size="16" fill="#f7f8fa" font-weight="900">Water Drop</text>
+      <text x="46" y="16" font-family="Arial Black, sans-serif" font-size="16" fill="#f7f8fa" font-weight="900">WaterDrop</text>
       <circle cx="49" cy="27" r="3.5" fill="#8fb89a"/>
       <text x="60" y="31" font-family="Consolas, monospace" font-size="10" fill="#878b91">Serve ready</text>
     </g>
