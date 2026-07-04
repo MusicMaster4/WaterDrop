@@ -604,6 +604,12 @@ body::before {
 .upload-status.queued {
   color: var(--faint);
 }
+.upload-dismiss {
+  width: 26px;
+  height: 26px;
+  border-color: transparent;
+  background: transparent;
+}
 .upload-tail {
   display: flex;
   align-items: center;

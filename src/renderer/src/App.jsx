@@ -34,6 +34,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import logoUrl from "./logo.png";
 import {
   PAGE_UPLOAD_LOCK_MS,
+  STALE_UPLOAD_LOCK_MS,
   claimQueuedUpload,
   clearQueuedUpload,
   isUploadQueueSupported,
@@ -41,6 +42,7 @@ import {
   markQueuedUploadFailed,
   markQueuedUploadSyncing,
   queueUpload,
+  recoverInterruptedUploads,
   requestBackgroundFetchUpload,
   requestBackgroundUploadSync,
   touchQueuedUploadLock,
@@ -55,6 +57,7 @@ const TAILSCALE_ANDROID_URL = "https://play.google.com/store/apps/details?id=com
 // First-run setup guide: Welcome → This PC → Phone → Publish → Finish.
 const ONBOARDING_STEPS = ["Welcome", "This PC", "Phone", "Publish", "Finish"];
 const LAST_ONBOARD_STEP = ONBOARDING_STEPS.length - 1;
+const UPLOAD_STALL_MS = Math.max(90 * 1000, STALE_UPLOAD_LOCK_MS);
 
 const apiDefault = {
   getInfo: () => request("api/info"),
@@ -93,6 +96,7 @@ export default function App() {
   const noticeTimeoutRef = useRef(null);
   const serviceWorkerRegistrationRef = useRef(null);
   const drainingUploadsRef = useRef(false);
+  const lastUploadPauseNoticeRef = useRef(0);
   const [api, setApi] = useState(apiDefault);
   const [appInfo, setAppInfo] = useState(null);
   const [info, setInfo] = useState(null);
@@ -173,6 +177,13 @@ export default function App() {
     }
   }, []);
 
+  const notifyUploadPaused = useCallback((message = "Upload paused. It will retry when possible.") => {
+    const now = Date.now();
+    if (now - lastUploadPauseNoticeRef.current < 30 * 1000) return;
+    lastUploadPauseNoticeRef.current = now;
+    notify(message, "warn");
+  }, [notify]);
+
   const startBackgroundFetchUpload = useCallback(async (record) => {
     const registration = serviceWorkerRegistrationRef.current;
     if (!registration?.backgroundFetch?.fetch) return false;
@@ -202,6 +213,7 @@ export default function App() {
     if (drainingUploadsRef.current || !api.rawUploadUrl || !isUploadQueueSupported()) return;
     drainingUploadsRef.current = true;
     try {
+      await recoverInterruptedUploads("Upload interrupted by app suspend");
       const records = await listQueuedUploads();
       for (const record of records) {
         const activeBackgroundFetch = await serviceWorkerRegistrationRef.current?.backgroundFetch
@@ -213,7 +225,7 @@ export default function App() {
         await uploadQueuedRecord({
           api,
           record: claimed,
-          notify,
+          notifyUploadPaused,
           refreshFiles,
           registerBackgroundUpload,
           setUploads,
@@ -223,7 +235,7 @@ export default function App() {
       drainingUploadsRef.current = false;
       await refreshQueuedUploads();
     }
-  }, [api, notify, refreshFiles, refreshQueuedUploads, registerBackgroundUpload]);
+  }, [api, notifyUploadPaused, refreshFiles, refreshQueuedUploads, registerBackgroundUpload]);
 
   useEffect(() => {
     if (!("serviceWorker" in navigator) || !window.isSecureContext) {
@@ -307,7 +319,12 @@ export default function App() {
   useEffect(() => {
     if (busy) return undefined;
     const refreshQuietly = () => refreshFiles({ silent: true });
-    const interval = window.setInterval(refreshQuietly, window.EventSource ? 15000 : 3000);
+    const retryUploadsQuietly = () => {
+      registerBackgroundUpload();
+      refreshQueuedUploads().then(drainQueuedUploads);
+    };
+    const refreshInterval = window.setInterval(refreshQuietly, window.EventSource ? 15000 : 3000);
+    const uploadRetryInterval = window.setInterval(retryUploadsQuietly, 15000);
     let events = null;
     if (window.EventSource && api.eventsUrl) {
       events = new EventSource(api.eventsUrl);
@@ -317,18 +334,18 @@ export default function App() {
       if (document.visibilityState === "visible") {
         refreshQuietly();
         refreshInfo({ silent: true });
-        refreshQueuedUploads().then(drainQueuedUploads);
+        retryUploadsQuietly();
       }
     };
     const onOnline = () => {
-      registerBackgroundUpload();
-      refreshQueuedUploads().then(drainQueuedUploads);
+      retryUploadsQuietly();
     };
     window.addEventListener("online", onOnline);
     window.addEventListener("focus", onOnline);
     document.addEventListener("visibilitychange", onVisible);
     return () => {
-      window.clearInterval(interval);
+      window.clearInterval(refreshInterval);
+      window.clearInterval(uploadRetryInterval);
       events?.close();
       window.removeEventListener("online", onOnline);
       window.removeEventListener("focus", onOnline);
@@ -544,6 +561,19 @@ export default function App() {
       );
       if (browserBackground < queued) drainQueuedUploads();
     }
+  }
+
+  async function dismissUpload(upload) {
+    if (!upload) return;
+    if (upload.queued) {
+      try {
+        await clearQueuedUpload(upload.id);
+      } catch (err) {
+        notify(err.message || "Could not remove upload", "warn");
+        return;
+      }
+    }
+    setUploads((items) => items.filter((item) => item.id !== upload.id));
   }
 
   function uploadOneLegacy(file) {
@@ -866,6 +896,11 @@ export default function App() {
                     <span className={`upload-status mono small ${upload.status === "done" ? "ok" : upload.status === "error" ? "err" : upload.status === "queued" ? "queued" : ""}`}>
                       {uploadStatusText(upload)}
                     </span>
+                    {canDismissUpload(upload) && (
+                      <button className="icon-btn upload-dismiss" title="Remove upload" onClick={() => dismissUpload(upload)}>
+                        <X size={14} />
+                      </button>
+                    )}
                   </div>
                   <div className="upload-tail">
                     <div className="upload-bar">
@@ -1573,7 +1608,7 @@ async function request(url, options = {}) {
 async function uploadQueuedRecord({
   api,
   record,
-  notify,
+  notifyUploadPaused,
   refreshFiles,
   registerBackgroundUpload,
   setUploads,
@@ -1590,12 +1625,53 @@ async function uploadQueuedRecord({
   try {
     await new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
+      let settled = false;
+      let lastActivityAt = Date.now();
+
+      const cleanup = () => {
+        window.clearInterval(stallTimer);
+        window.removeEventListener("offline", onOffline);
+        window.removeEventListener("pagehide", onPageHide);
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      };
+      const settle = (handler, value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        handler(value);
+      };
+      const fail = (message) => {
+        if (settled) return;
+        try {
+          xhr.abort();
+        } catch {}
+        settle(reject, new Error(message));
+      };
+      const markActivity = () => {
+        lastActivityAt = Date.now();
+      };
+      const onOffline = () => fail("Upload paused while offline");
+      const onPageHide = () => fail("Upload paused while app was backgrounded");
+      const onVisibilityChange = () => {
+        if (document.visibilityState === "hidden") fail("Upload paused while app was backgrounded");
+      };
+      const stallTimer = window.setInterval(() => {
+        if (Date.now() - lastActivityAt > UPLOAD_STALL_MS) {
+          fail("Upload paused after the connection stopped responding");
+        }
+      }, 5000);
+
+      window.addEventListener("offline", onOffline);
+      window.addEventListener("pagehide", onPageHide);
+      document.addEventListener("visibilitychange", onVisibilityChange);
+
       xhr.open("POST", uploadUrl, true);
       xhr.setRequestHeader("Content-Type", record.mimeType || "application/octet-stream");
       xhr.setRequestHeader("X-WaterDrop-File-Name", encodeURIComponent(record.name || "unnamed-file"));
       xhr.setRequestHeader("X-WaterDrop-Mime-Type", record.mimeType || "application/octet-stream");
       xhr.setRequestHeader("X-WaterDrop-Upload-Id", record.id);
       xhr.upload.onprogress = (event) => {
+        markActivity();
         if (!event.lengthComputable) return;
         const progress = Math.round((event.loaded / event.total) * 100);
         setUploads((items) => upsertUpload(items, { ...view, status: "uploading", progress }));
@@ -1604,15 +1680,16 @@ async function uploadQueuedRecord({
           updateQueuedUploadProgress(record.id, progress).catch(() => {});
         }
       };
+      xhr.upload.onload = markActivity;
       xhr.onload = () => {
         if (xhr.status >= 200 && xhr.status < 300) {
-          resolve();
+          settle(resolve);
           return;
         }
-        reject(new Error(`HTTP ${xhr.status}`));
+        settle(reject, new Error(`HTTP ${xhr.status}`));
       };
-      xhr.onerror = () => reject(new Error("Network error"));
-      xhr.onabort = () => reject(new Error("Upload aborted"));
+      xhr.onerror = () => settle(reject, new Error("Network error"));
+      xhr.onabort = () => settle(reject, new Error("Upload aborted"));
       xhr.send(record.blob);
     });
 
@@ -1626,7 +1703,7 @@ async function uploadQueuedRecord({
     const queued = await markQueuedUploadFailed(record.id, err.message || "Upload paused");
     if (queued) setUploads((items) => upsertUpload(items, uploadRecordToView(queued)));
     await registerBackgroundUpload();
-    notify("Upload paused. It will retry when possible.", "warn");
+    notifyUploadPaused?.();
   } finally {
     window.clearInterval(lockTimer);
   }
@@ -1648,6 +1725,10 @@ function uploadStatusText(upload) {
   if (upload.status === "queued") return "queued";
   if (upload.status === "syncing") return "syncing";
   return `${upload.progress || 0}%`;
+}
+
+function canDismissUpload(upload) {
+  return upload.status === "queued" || upload.status === "error";
 }
 
 function isWaterDropDrag(event) {
@@ -1735,7 +1816,17 @@ function shortHash(hash) {
 
 function formatAppVersion(version) {
   const raw = String(version || "");
-  const match = raw.match(/^(\d+)\.(\d+)\.(\d+)$/);
-  if (!match) return raw;
-  return `${Number(match[1])}.${Number(match[2])}.${String(Number(match[3])).padStart(2, "0")}`;
+  // Stable release: pad the patch to two digits (e.g. 0.1.2 -> 0.1.02).
+  const stable = raw.match(/^(\d+)\.(\d+)\.(\d+)$/);
+  if (stable) {
+    return `${Number(stable[1])}.${Number(stable[2])}.${String(Number(stable[3])).padStart(2, "0")}`;
+  }
+  // Beta channel: its internal id is "-testing.N" (electron-updater reserves
+  // "beta" for cascading updates), but users see it labelled as "beta".
+  const beta = raw.match(/^(\d+)\.(\d+)\.(\d+)-testing\.(\d+)$/);
+  if (beta) {
+    const base = `${Number(beta[1])}.${Number(beta[2])}.${String(Number(beta[3])).padStart(2, "0")}`;
+    return `${base}-beta.${Number(beta[4])}`;
+  }
+  return raw;
 }
