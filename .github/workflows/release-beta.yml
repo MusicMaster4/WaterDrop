@@ -159,6 +159,15 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # electron-builder's GitHub provider ignores the version-derived channel,
+      # so every build would otherwise publish `latest.yml`. Force the update
+      # manifest onto the isolated `testing.yml` channel for beta builds. (The
+      # stable workflow does NOT do this, so it keeps writing `latest.yml`.)
+      - name: Force beta update channel (testing.yml)
+        shell: bash
+        run: |
+          node -e "const fs=require('fs'),yaml=require('js-yaml');const f='electron-builder.yml';const c=yaml.load(fs.readFileSync(f,'utf8'));const arr=Array.isArray(c.publish)?c.publish:[c.publish];arr.forEach(p=>{if(p&&p.provider==='github')p.channel='testing';});c.publish=arr;fs.writeFileSync(f,yaml.dump(c));console.log('electron-builder.yml publish channel set to testing');"
+
       - name: Build renderer
         run: npm run build
 
