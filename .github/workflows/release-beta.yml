@@ -5,21 +5,25 @@ name: Build & Release (Beta)
 # Runs automatically on every push to `testing` (code changes) and can also be
 # run by hand from Actions → "Build & Release (Beta)" → Run workflow. Each run
 # computes the next beta version, builds the Windows installer, and publishes a
-# GitHub *prerelease* carrying a `beta.yml` manifest.
+# GitHub *prerelease* carrying a `testing.yml` manifest.
 #
 # Isolation from the stable channel (see .github/workflows/release.yml):
-#   • Beta versions look like  X.Y.Z-beta.N  → electron-builder emits `beta.yml`.
+#   • Beta versions look like  X.Y.Z-testing.N  → electron-builder emits
+#     `testing.yml`. The channel is deliberately named "testing" and NOT "beta":
+#     electron-updater hardcodes "alpha"/"beta" as cascading channels that also
+#     pull stable releases, which would break isolation. "testing" is treated as
+#     a fully isolated channel. (See the note in src/main/updater.js.)
 #   • The release is marked --prerelease and is NEVER --latest, so it does not
 #     replace the stable release on the repo's main page.
-#   • Only installs built from this workflow (channel = beta, see updater.js)
+#   • Only installs built from this workflow (channel = testing, see updater.js)
 #     detect these updates. Stable installs ignore prereleases entirely.
 #
 # Versioning:
 #   • Base X.Y.Z = the next patch above the latest stable release (odometer:
 #     patch 0→99 carries into minor, minor 0→9 carries into major), or the
 #     numeric part of package.json if it is already higher.
-#   • N = beta counter for that base: first beta is -beta.1, then -beta.2, ...
-#     A brand-new base restarts the counter at 1.
+#   • N = beta counter for that base: first beta is -testing.1, then -testing.2,
+#     ... A brand-new base restarts the counter at 1.
 #   • Manual run with "publish" unchecked → test build (installer artifact only,
 #     no release, no tag).
 on:
@@ -72,7 +76,7 @@ jobs:
           if [ -z "$BUMP" ]; then BUMP=patch; fi
           if [ -z "$PUBLISH" ]; then PUBLISH=true; fi
 
-          # Numeric part of package.json (drop any -beta suffix).
+          # Numeric part of package.json (drop any prerelease suffix).
           PKG=$(node -p "require('./package.json').version" | sed 's/-.*$//')
 
           # Latest STABLE release (plain X.Y.Z tags only — beta tags excluded).
@@ -109,11 +113,11 @@ jobs:
           fi
 
           # Highest existing beta counter for this base, then +1.
-          LASTN=$(git tag -l "v$BASE-beta.*" | sed "s/^v$BASE-beta\.//" \
+          LASTN=$(git tag -l "v$BASE-testing.*" | sed "s/^v$BASE-testing\.//" \
             | grep -E '^[0-9]+$' | sort -n | tail -n1 || true)
           if [ -z "$LASTN" ]; then N=1; else N=$((LASTN+1)); fi
 
-          NEW="$BASE-beta.$N"
+          NEW="$BASE-testing.$N"
 
           echo "version=$NEW"     >> "$GITHUB_OUTPUT"
           echo "tag=v$NEW"        >> "$GITHUB_OUTPUT"

@@ -1816,7 +1816,17 @@ function shortHash(hash) {
 
 function formatAppVersion(version) {
   const raw = String(version || "");
-  const match = raw.match(/^(\d+)\.(\d+)\.(\d+)$/);
-  if (!match) return raw;
-  return `${Number(match[1])}.${Number(match[2])}.${String(Number(match[3])).padStart(2, "0")}`;
+  // Stable release: pad the patch to two digits (e.g. 0.1.2 -> 0.1.02).
+  const stable = raw.match(/^(\d+)\.(\d+)\.(\d+)$/);
+  if (stable) {
+    return `${Number(stable[1])}.${Number(stable[2])}.${String(Number(stable[3])).padStart(2, "0")}`;
+  }
+  // Beta channel: its internal id is "-testing.N" (electron-updater reserves
+  // "beta" for cascading updates), but users see it labelled as "beta".
+  const beta = raw.match(/^(\d+)\.(\d+)\.(\d+)-testing\.(\d+)$/);
+  if (beta) {
+    const base = `${Number(beta[1])}.${Number(beta[2])}.${String(Number(beta[3])).padStart(2, "0")}`;
+    return `${base}-beta.${Number(beta[4])}`;
+  }
+  return raw;
 }

@@ -84,12 +84,21 @@ function initUpdater(window) {
   autoUpdater.autoInstallOnAppQuit = true;
 
   // Channel isolation: the build's own version decides which release channel it
-  // follows. A beta build (version like `1.2.3-beta.4`) reads only `beta.yml`
-  // from prerelease GitHub Releases; a stable build (`1.2.3`) reads only
-  // `latest.yml` from full releases. Neither ever sees the other's updates.
-  const isBeta = app.getVersion().includes("-");
-  autoUpdater.channel = isBeta ? "beta" : "latest";
-  autoUpdater.allowPrerelease = isBeta; // beta must opt in to prerelease GitHub Releases
+  // follows. A prerelease build (e.g. `1.2.3-testing.4`) follows a custom
+  // channel named after its prerelease tag ("testing") and reads only
+  // `testing.yml` from prerelease GitHub Releases. A stable build (`1.2.3`)
+  // follows "latest" and reads only `latest.yml`.
+  //
+  // The channel name must NOT be "alpha"/"beta": electron-updater's GitHub
+  // provider hardcodes those two as cascading channels — a beta client is made
+  // to also accept stable releases and fall back to `latest.yml`, which would
+  // defeat the isolation. Any other name is treated as a fully isolated channel.
+  const version = app.getVersion();
+  const prereleaseTag = version.includes("-")
+    ? version.split("-")[1].split(".")[0]
+    : null;
+  autoUpdater.channel = prereleaseTag || "latest";
+  autoUpdater.allowPrerelease = prereleaseTag !== null;
 
   wireAutoUpdaterEvents();
 
