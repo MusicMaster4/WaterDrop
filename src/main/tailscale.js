@@ -131,9 +131,12 @@ async function inspect(port, { httpsPort } = {}) {
     serveProxy: handler ? handler.proxy : null,
     serveUrl,
     directUrl,
+    // Advertised for the client to probe and route bulk transfers through when
+    // reachable, but NOT the QR link: a phone must be able to open the QR, and
+    // the direct port may be blocked by the Windows firewall. Serve always works.
     httpsDirectUrl,
     localUrl,
-    preferredUrl: httpsDirectUrl || (handler && serveUrl ? serveUrl : directUrl || localUrl),
+    preferredUrl: handler && serveUrl ? serveUrl : directUrl || localUrl,
     serveCommand: `tailscale serve --bg --yes --set-path /drop http://127.0.0.1:${port}`,
   };
 }

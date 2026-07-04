@@ -111,6 +111,11 @@ export default function App() {
   const serviceWorkerRegistrationRef = useRef(null);
   const drainingUploadsRef = useRef(false);
   const lastUploadPauseNoticeRef = useRef(0);
+  // When the direct HTTPS origin is reachable, bulk transfers are routed through
+  // it (HTTP/1.1 -> real parallel connections). Null means "use this page's
+  // origin" (e.g. Tailscale Serve). Held in a ref so it can change mid-session
+  // without rebuilding upload callbacks.
+  const transferBaseRef = useRef(null);
   const [api, setApi] = useState(apiDefault);
   const [appInfo, setAppInfo] = useState(null);
   const [info, setInfo] = useState(null);
@@ -245,6 +250,7 @@ export default function App() {
           await uploadQueuedRecord({
             api,
             record: claimed,
+            transferBase: transferBaseRef.current,
             notifyUploadPaused,
             refreshFiles,
             registerBackgroundUpload,
@@ -341,6 +347,44 @@ export default function App() {
     refreshFiles();
     refreshQueuedUploads().then(drainQueuedUploads);
   }, [busy, drainQueuedUploads, refreshFiles, refreshInfo, refreshQueuedUploads]);
+
+  // Probe the direct HTTPS origin. If a phone can reach it, route bulk transfers
+  // there for real parallel (HTTP/1.1) connections; otherwise stay on this page's
+  // origin (e.g. Tailscale Serve) so nothing breaks.
+  const directTransferUrl = info?.network?.httpsDirectUrl || null;
+  useEffect(() => {
+    if (isDesktop || !directTransferUrl) {
+      transferBaseRef.current = null;
+      return undefined;
+    }
+    let directOrigin;
+    try {
+      directOrigin = new URL(directTransferUrl).origin;
+    } catch {
+      transferBaseRef.current = null;
+      return undefined;
+    }
+    if (directOrigin === window.location.origin) {
+      transferBaseRef.current = directTransferUrl;
+      return undefined;
+    }
+    let cancelled = false;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 3500);
+    fetch(new URL("api/ping", directTransferUrl), { cache: "no-store", signal: controller.signal })
+      .then((res) => {
+        if (!cancelled) transferBaseRef.current = res.ok ? directTransferUrl : null;
+      })
+      .catch(() => {
+        if (!cancelled) transferBaseRef.current = null;
+      })
+      .finally(() => window.clearTimeout(timer));
+    return () => {
+      cancelled = true;
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [directTransferUrl, isDesktop]);
 
   useEffect(() => {
     if (busy) return undefined;
@@ -699,9 +743,11 @@ export default function App() {
   async function browserDownload(file) {
     if (shouldAccelerateDownload(file)) {
       let lastPct = -100;
+      const base = transferBaseRef.current;
+      const url = base ? new URL(`api/files/${file.id}/download`, base).toString() : api.downloadUrl(file.id);
       try {
         notify(`Downloading ${file.name}…`, "info");
-        await parallelDownload(file, api.downloadUrl(file.id), {
+        await parallelDownload(file, url, {
           onProgress: (pct) => {
             if (pct - lastPct >= 10) {
               lastPct = pct;
@@ -1333,7 +1379,7 @@ function UpdateInline({ update, onDownload, onInstall }) {
   return (
     <div className={`update-inline ${state === "error" ? "is-error" : ""}`} role="status">
       {state === "checking" && <span className="mono small muted">Checking for updates...</span>}
-      {state === "up-to-date" && <span className="mono small muted">You're on the latest version.</span>}
+      {state === "up-to-date" && <span className="mono small muted">{update.message || "You're on the latest version."}</span>}
       {state === "dev" && <span className="mono small muted">Updates run only in the installed app.</span>}
       {state === "error" && <span className="mono small danger">{update.message || "Update check failed."}</span>}
       {state === "available" && (
@@ -1788,12 +1834,17 @@ async function request(url, options = {}) {
 async function uploadQueuedRecord({
   api,
   record,
+  transferBase = null,
   notifyUploadPaused,
   refreshFiles,
   registerBackgroundUpload,
   setUploads,
 }) {
-  const uploadUrl = record.uploadUrl || api.rawUploadUrl;
+  // Route through the direct HTTPS origin when it's reachable (real parallel
+  // HTTP/1.1 connections); otherwise use this page's origin.
+  const uploadUrl = transferBase
+    ? new URL("api/files/raw", transferBase).toString()
+    : record.uploadUrl || api.rawUploadUrl;
   const view = uploadRecordToView(record);
   setUploads((items) => upsertUpload(items, { ...view, status: "uploading", progress: 0 }));
 

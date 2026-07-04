@@ -631,6 +631,13 @@ async function handleApi({ req, res, relative, store, getPort, getHttpsPort, eve
     return;
   }
 
+  if ((req.method === "GET" || req.method === "HEAD") && relative === "/api/ping") {
+    // Cheap, side-effect-free reachability probe (used to test the direct HTTPS
+    // origin before routing bulk transfers through it).
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
   if (req.method === "POST" && relative === "/api/tailscale/serve") {
     const result = await tailscale.configureServe(getPort());
     sendJson(res, result.ok ? 200 : 500, result);
@@ -1466,6 +1473,9 @@ function corsHeaders() {
     "Access-Control-Allow-Headers": "Content-Type, Range, X-WaterDrop-File-Name, X-WaterDrop-Mime-Type, X-WaterDrop-Upload-Id, X-WaterDrop-Folder-Id, X-WaterDrop-Chunk-Offset, X-WaterDrop-Total-Size, X-WaterDrop-No-Count",
     "Access-Control-Allow-Methods": "GET, HEAD, POST, PATCH, DELETE, OPTIONS",
     "Access-Control-Allow-Origin": "*",
+    // Cache preflights so cross-origin chunk/range transfers to the direct HTTPS
+    // origin don't pay an OPTIONS round-trip per request.
+    "Access-Control-Max-Age": "600",
     "Access-Control-Expose-Headers": "Accept-Ranges, Content-Disposition, Content-Length, Content-Range, ETag, Last-Modified, X-WaterDrop-SHA256",
   };
 }

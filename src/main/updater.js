@@ -45,6 +45,10 @@ function wireAutoUpdaterEvents() {
   });
 
   autoUpdater.on("error", (err) => {
+    if (isUpdateManifestNotReady(err)) {
+      send({ state: "up-to-date", message: "No update is ready yet." });
+      return;
+    }
     send({ state: "error", message: (err && err.message) || String(err) });
   });
 }
@@ -59,6 +63,16 @@ function normalizeNotes(notes) {
   return "";
 }
 
+function isUpdateManifestNotReady(err) {
+  const message = (err && err.message) || String(err);
+  const code = err && err.code;
+
+  return (
+    code === "ERR_UPDATER_CHANNEL_FILE_NOT_FOUND" ||
+    /Cannot find (latest|testing)\.yml in the latest release artifacts/i.test(message)
+  );
+}
+
 async function checkForUpdates({ silent = false } = {}) {
   if (!app.isPackaged) {
     send({ state: "dev" });
@@ -69,6 +83,10 @@ async function checkForUpdates({ silent = false } = {}) {
   try {
     await autoUpdater.checkForUpdates();
   } catch (err) {
+    if (isUpdateManifestNotReady(err)) {
+      send({ state: "up-to-date", message: "No update is ready yet." });
+      return lastStatus;
+    }
     if (!silent) send({ state: "error", message: (err && err.message) || String(err) });
   } finally {
     checkInFlight = false;
