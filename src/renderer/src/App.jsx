@@ -1141,6 +1141,18 @@ function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onDownload }
   const kind = previewKindFor(file);
   const previewUrl = api.previewUrl(file.id);
   const [contextMenu, setContextMenu] = useState(null);
+  const [closing, setClosing] = useState(false);
+  const closeTimer = useRef(null);
+
+  const requestClose = useCallback(() => {
+    setClosing((already) => {
+      if (already) return already;
+      closeTimer.current = window.setTimeout(() => onClose(), 200);
+      return true;
+    });
+  }, [onClose]);
+
+  useEffect(() => () => window.clearTimeout(closeTimer.current), []);
 
   const copyImageFromPreview = useCallback(async () => {
     if (kind !== "image") return;
@@ -1161,7 +1173,7 @@ function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onDownload }
           setContextMenu(null);
           return;
         }
-        onClose();
+        requestClose();
       }
       if (kind === "image" && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") {
         event.preventDefault();
@@ -1170,7 +1182,7 @@ function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onDownload }
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [contextMenu, copyImageFromPreview, kind, onClose]);
+  }, [contextMenu, copyImageFromPreview, kind, requestClose]);
 
   useEffect(() => {
     if (!contextMenu) return undefined;
@@ -1185,9 +1197,9 @@ function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onDownload }
 
   return (
     <div
-      className="preview-overlay"
+      className={`preview-overlay ${closing ? "closing" : ""}`}
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
+        if (event.target === event.currentTarget) requestClose();
       }}
     >
       <section className="preview-dialog" aria-label={`Preview ${file.name}`} aria-modal="true" role="dialog">
@@ -1202,7 +1214,7 @@ function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onDownload }
               <span>{timeLeft(file.expiresAt)}</span>
             </div>
           </div>
-          <button className="icon-btn" title="Close preview" onClick={onClose}>
+          <button className="icon-btn" title="Close preview" onClick={requestClose}>
             <X size={16} />
           </button>
         </header>
