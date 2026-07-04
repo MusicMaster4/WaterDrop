@@ -34,6 +34,9 @@ const PENDING_UPLOAD_TIMEOUT_MS = 60 * 60 * 1000;
 // A stalled chunked-upload assembly (some chunks never arrive) is torn down after
 // this long so its temp file and placeholder don't linger.
 const UPLOAD_SESSION_TIMEOUT_MS = 60 * 60 * 1000;
+// If a queued/background upload retries after the user has deleted its completed
+// file, acknowledge the retry without recreating the deleted item.
+const DELETED_UPLOAD_TOMBSTONE_MS = RETENTION_MS;
 
 class FileStore extends EventEmitter {
   constructor({ dataDir, defaultDownloadDir }) {
@@ -43,9 +46,11 @@ class FileStore extends EventEmitter {
     this.tmpDir = path.join(dataDir, "tmp");
     this.dragDir = path.join(dataDir, "drag");
     this.metaPath = path.join(dataDir, "files.json");
+    this.deletedUploadsPath = path.join(dataDir, "deleted-uploads.json");
     this.settingsPath = path.join(dataDir, "settings.json");
     this.defaultDownloadDir = defaultDownloadDir;
     this.filesSaveQueue = Promise.resolve();
+    this.deletedUploadsSaveQueue = Promise.resolve();
     this.pendingDownloadRecords = new Set();
     this.pendingDownloadSaveTimer = null;
     // In-flight uploads, keyed by the id the finished file will receive, so every
@@ -56,6 +61,7 @@ class FileStore extends EventEmitter {
     // file, then hashes + commits it exactly like a single-shot upload.
     this.uploadSessions = new Map();
     this.files = [];
+    this.deletedUploads = {};
     this.settings = {
       downloadDir: defaultDownloadDir,
       retentionDays: 7,
@@ -76,6 +82,7 @@ class FileStore extends EventEmitter {
 
   async load() {
     this.files = await readJson(this.metaPath, []);
+    this.deletedUploads = normalizeDeletedUploads(await readJson(this.deletedUploadsPath, {}));
     this.settings = {
       ...this.settings,
       ...(await readJson(this.settingsPath, {})),
@@ -87,6 +94,13 @@ class FileStore extends EventEmitter {
       .catch(() => {})
       .then(() => writeJsonAtomic(this.metaPath, this.files));
     await this.filesSaveQueue;
+  }
+
+  async saveDeletedUploads() {
+    this.deletedUploadsSaveQueue = this.deletedUploadsSaveQueue
+      .catch(() => {})
+      .then(() => writeJsonAtomic(this.deletedUploadsPath, this.deletedUploads));
+    await this.deletedUploadsSaveQueue;
   }
 
   async saveSettings() {
@@ -210,6 +224,12 @@ class FileStore extends EventEmitter {
   }
 
   async addFromTemp({ id, tempPath, originalName, mimeType, size, sha256, folderId }) {
+    if (this.isDeletedUpload(id) || (folderId && this.isDeletedUpload(folderId))) {
+      await removeIfExists(tempPath);
+      this.clearPendingUpload(id);
+      this.notifyFilesChanged("upload-deleted");
+      return null;
+    }
     const folder = folderId ? this.getFolder(folderId) : null;
     const ext = safeExtension(originalName);
     const storedName = `${id}${ext}`;
@@ -236,6 +256,39 @@ class FileStore extends EventEmitter {
     await this.saveFiles();
     this.notifyFilesChanged("upload");
     return toPublicFile(entry, this);
+  }
+
+  isDeletedUpload(id) {
+    if (!isValidFileId(id)) return false;
+    const expiresAt = Number(this.deletedUploads[id] || 0);
+    if (!expiresAt) return false;
+    if (expiresAt > Date.now()) return true;
+    delete this.deletedUploads[id];
+    this.saveDeletedUploads().catch((err) => console.error("Could not save deleted upload metadata", err));
+    return false;
+  }
+
+  async rememberDeletedUploads(ids) {
+    const now = Date.now();
+    let changed = false;
+    for (const id of ids) {
+      if (!isValidFileId(id)) continue;
+      this.deletedUploads[id] = now + DELETED_UPLOAD_TOMBSTONE_MS;
+      changed = true;
+    }
+    changed = this.cleanupDeletedUploads(now) || changed;
+    if (changed) await this.saveDeletedUploads();
+  }
+
+  cleanupDeletedUploads(now = Date.now()) {
+    let changed = false;
+    for (const [id, expiresAt] of Object.entries(this.deletedUploads)) {
+      if (!isValidFileId(id) || Number(expiresAt || 0) <= now) {
+        delete this.deletedUploads[id];
+        changed = true;
+      }
+    }
+    return changed;
   }
 
   // --- Chunked (parallel) upload assembly ---------------------------------
@@ -397,6 +450,7 @@ class FileStore extends EventEmitter {
     );
     await removeDirIfExists(path.join(this.dragDir, file.id));
     await this.saveFiles();
+    await this.rememberDeletedUploads([file.id, ...payloads.map((entry) => entry.id)]);
     this.notifyFilesChanged("delete");
     return true;
   }
@@ -408,6 +462,7 @@ class FileStore extends EventEmitter {
     await removeDirIfExists(this.dragDir);
     await fsp.mkdir(this.dragDir, { recursive: true });
     await this.saveFiles();
+    await this.rememberDeletedUploads(files.map((file) => file.id));
     if (files.length) this.notifyFilesChanged("clear");
     return files.filter((file) => !file.folderId).length;
   }
@@ -456,11 +511,15 @@ class FileStore extends EventEmitter {
 
   async cleanupExpired() {
     const now = Date.now();
+    const deletedUploadsChanged = this.cleanupDeletedUploads(now);
     const expiredFolderIds = new Set(
       this.files.filter((file) => file.kind === "folder" && file.expiresAt <= now).map((file) => file.id)
     );
     const expired = this.files.filter((file) => file.expiresAt <= now || expiredFolderIds.has(file.folderId));
-    if (!expired.length) return 0;
+    if (!expired.length) {
+      if (deletedUploadsChanged) await this.saveDeletedUploads();
+      return 0;
+    }
     const expiredIds = new Set(expired.map((file) => file.id));
     this.files = this.files.filter((file) => !expiredIds.has(file.id));
     await Promise.all(
@@ -471,6 +530,7 @@ class FileStore extends EventEmitter {
       })
     );
     await this.saveFiles();
+    await this.rememberDeletedUploads(expired.map((file) => file.id));
     this.notifyFilesChanged("expire");
     return expired.length;
   }
@@ -717,12 +777,17 @@ async function handleRawUpload(req, res, store) {
   const requestedId = cleanHeaderValue(req.headers["x-waterdrop-upload-id"]);
   const requestedFolderId = cleanHeaderValue(req.headers["x-waterdrop-folder-id"]);
   const folderId = isValidFileId(requestedFolderId) ? requestedFolderId : "";
+  const id = isValidFileId(requestedId) ? requestedId : crypto.randomUUID();
+  if (store.isDeletedUpload(id) || (folderId && store.isDeletedUpload(folderId))) {
+    req.resume();
+    sendJson(res, 200, { files: [], deleted: true, duplicate: true });
+    return;
+  }
   if (folderId && !store.getFolder(folderId)) {
     req.resume();
     sendJson(res, 404, { error: "Folder not found" });
     return;
   }
-  const id = isValidFileId(requestedId) ? requestedId : crypto.randomUUID();
   const existingFile = store.get(id);
   if (existingFile) {
     req.resume();
@@ -784,6 +849,10 @@ async function handleRawUpload(req, res, store) {
       sha256: hash.digest("hex"),
       folderId,
     });
+    if (!file) {
+      sendJson(res, 200, { files: [], deleted: true, duplicate: true });
+      return;
+    }
     sendJson(res, 201, { files: [file] });
   } catch (err) {
     store.removePendingUpload(id, "upload-failed");
@@ -830,6 +899,10 @@ async function handleChunkUpload(req, res, store, { id, originalName, mimeType, 
       session.finalizing = true;
       try {
         const file = await store.finalizeUploadSession({ id, originalName, mimeType });
+        if (!file) {
+          sendJson(res, 200, { files: [], deleted: true, duplicate: true });
+          return;
+        }
         sendJson(res, 201, { files: [file] });
       } catch (err) {
         session.finalizing = false;
@@ -1491,6 +1564,17 @@ async function readJson(filePath, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function normalizeDeletedUploads(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const normalized = {};
+  for (const [id, expiresAt] of Object.entries(value)) {
+    if (isValidFileId(id) && Number(expiresAt || 0) > Date.now()) {
+      normalized[id] = Number(expiresAt);
+    }
+  }
+  return normalized;
 }
 
 async function readRequestJson(req) {

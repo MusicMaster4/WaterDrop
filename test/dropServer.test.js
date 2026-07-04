@@ -209,6 +209,77 @@ test("pending upload placeholder clears once the file lands", async () => {
   }
 });
 
+test("deleted uploads are not recreated by stale queued retries", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-deleted-retry-test-"));
+  const rendererDir = path.join(root, "renderer");
+  const dataDir = path.join(root, "data");
+  const downloads = path.join(root, "downloads");
+  await fs.mkdir(rendererDir, { recursive: true });
+  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>WaterDrop</title>");
+
+  let server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 48020 });
+  try {
+    const id = "55555555-5555-4555-8555-555555555555";
+    const upload = await fetch(new URL("api/files/raw", server.localUrl), {
+      method: "POST",
+      body: new Blob(["original"], { type: "text/plain" }),
+      headers: {
+        "Content-Type": "text/plain",
+        "X-WaterDrop-File-Name": encodeURIComponent("retry.txt"),
+        "X-WaterDrop-Mime-Type": "text/plain",
+        "X-WaterDrop-Upload-Id": id,
+      },
+    });
+    assert.equal(upload.status, 201);
+
+    const deleted = await fetch(new URL(`api/files/${id}`, server.localUrl), { method: "DELETE" });
+    assert.equal(deleted.status, 200);
+
+    const staleRetry = await fetch(new URL("api/files/raw", server.localUrl), {
+      method: "POST",
+      body: new Blob(["stale retry"], { type: "text/plain" }),
+      headers: {
+        "Content-Type": "text/plain",
+        "X-WaterDrop-File-Name": encodeURIComponent("retry.txt"),
+        "X-WaterDrop-Mime-Type": "text/plain",
+        "X-WaterDrop-Upload-Id": id,
+      },
+    });
+    assert.equal(staleRetry.status, 200);
+    const staleRetryBody = await staleRetry.json();
+    assert.equal(staleRetryBody.deleted, true);
+    assert.equal(staleRetryBody.files.length, 0);
+
+    const afterRetry = await (await fetch(new URL("api/files", server.localUrl))).json();
+    assert.equal(afterRetry.files.length, 0);
+
+    await server.close();
+    server = null;
+    server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 48020 });
+
+    const staleRetryAfterRestart = await fetch(new URL("api/files/raw", server.localUrl), {
+      method: "POST",
+      body: new Blob(["stale retry after restart"], { type: "text/plain" }),
+      headers: {
+        "Content-Type": "text/plain",
+        "X-WaterDrop-File-Name": encodeURIComponent("retry.txt"),
+        "X-WaterDrop-Mime-Type": "text/plain",
+        "X-WaterDrop-Upload-Id": id,
+      },
+    });
+    assert.equal(staleRetryAfterRestart.status, 200);
+    const staleRetryAfterRestartBody = await staleRetryAfterRestart.json();
+    assert.equal(staleRetryAfterRestartBody.deleted, true);
+    assert.equal(staleRetryAfterRestartBody.files.length, 0);
+
+    const afterRestartRetry = await (await fetch(new URL("api/files", server.localUrl))).json();
+    assert.equal(afterRestartRetry.files.length, 0);
+  } finally {
+    await server?.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("bulk upload folders group files, rename, download as zip, and delete children", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-folder-test-"));
   const rendererDir = path.join(root, "renderer");
