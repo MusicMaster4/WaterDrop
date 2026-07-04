@@ -82,7 +82,14 @@ function initUpdater(window) {
 
   autoUpdater.autoDownload = false; // let the user decide when to download
   autoUpdater.autoInstallOnAppQuit = true;
-  autoUpdater.allowPrerelease = false;
+
+  // Channel isolation: the build's own version decides which release channel it
+  // follows. A beta build (version like `1.2.3-beta.4`) reads only `beta.yml`
+  // from prerelease GitHub Releases; a stable build (`1.2.3`) reads only
+  // `latest.yml` from full releases. Neither ever sees the other's updates.
+  const isBeta = app.getVersion().includes("-");
+  autoUpdater.channel = isBeta ? "beta" : "latest";
+  autoUpdater.allowPrerelease = isBeta; // beta must opt in to prerelease GitHub Releases
 
   wireAutoUpdaterEvents();
 
