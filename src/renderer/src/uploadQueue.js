@@ -1,6 +1,7 @@
 const DB_NAME = "waterdrop-upload-queue";
 const DB_VERSION = 1;
 const STORE_NAME = "uploads";
+const CANCELLED_UPLOAD_TOMBSTONE_MS = 7 * 24 * 60 * 60 * 1000;
 
 export const PAGE_UPLOAD_LOCK_MS = 45 * 1000;
 export const STALE_UPLOAD_LOCK_MS = 2 * PAGE_UPLOAD_LOCK_MS;
@@ -32,15 +33,28 @@ export async function queueUpload(file, uploadUrl, options = {}) {
   };
   if (options.folderId) record.folderId = options.folderId;
   if (options.folderName) record.folderName = options.folderName;
-  await putUploadRecord(record);
+  const stored = await putUploadRecord(record);
+  if (!stored) throw new Error("Upload was cancelled");
   return record;
 }
 
 export async function listQueuedUploads() {
   if (!isUploadQueueSupported()) return [];
   const db = await openDb();
-  return requestAsPromise(db.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).getAll())
-    .then((items) => items.sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0)));
+  const items = await requestAsPromise(db.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).getAll());
+  const now = Date.now();
+  const expiredCancelledIds = [];
+  const visible = [];
+  for (const item of items) {
+    if (isCancelledUploadRecord(item, now)) continue;
+    if (isExpiredCancelledUploadRecord(item, now)) {
+      expiredCancelledIds.push(item.id);
+      continue;
+    }
+    visible.push(item);
+  }
+  if (expiredCancelledIds.length) deleteUploadRecords(expiredCancelledIds).catch(() => {});
+  return visible.sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0));
 }
 
 export async function recoverInterruptedUploads(message = "Upload interrupted") {
@@ -76,8 +90,7 @@ export async function claimQueuedUpload(id) {
     lockedUntil: now + PAGE_UPLOAD_LOCK_MS,
     lastError: "",
   };
-  await putUploadRecord(claimed);
-  return claimed;
+  return await putUploadRecord(claimed) ? claimed : null;
 }
 
 export async function touchQueuedUploadLock(id) {
@@ -88,8 +101,7 @@ export async function touchQueuedUploadLock(id) {
     updatedAt: Date.now(),
     lockedUntil: Date.now() + PAGE_UPLOAD_LOCK_MS,
   };
-  await putUploadRecord(updated);
-  return updated;
+  return await putUploadRecord(updated) ? updated : null;
 }
 
 export async function updateQueuedUploadProgress(id, progress) {
@@ -100,8 +112,7 @@ export async function updateQueuedUploadProgress(id, progress) {
     progress: Math.max(1, Math.min(99, Number(progress || 0))),
     updatedAt: Date.now(),
   };
-  await putUploadRecord(updated);
-  return updated;
+  return await putUploadRecord(updated) ? updated : null;
 }
 
 export async function markQueuedUploadFailed(id, message) {
@@ -116,8 +127,7 @@ export async function markQueuedUploadFailed(id, message) {
     lockedUntil: 0,
     lastError: message || "Upload paused",
   };
-  await putUploadRecord(updated);
-  return updated;
+  return await putUploadRecord(updated) ? updated : null;
 }
 
 export async function markQueuedUploadSyncing(id) {
@@ -131,13 +141,28 @@ export async function markQueuedUploadSyncing(id) {
     lockedUntil: Date.now() + 2 * PAGE_UPLOAD_LOCK_MS,
     lastError: "",
   };
-  await putUploadRecord(updated);
-  return updated;
+  return await putUploadRecord(updated) ? updated : null;
 }
 
 export async function clearQueuedUpload(id) {
-  const db = await openDb();
-  await requestAsPromise(db.transaction(STORE_NAME, "readwrite").objectStore(STORE_NAME).delete(id));
+  if (!id) return;
+  const now = Date.now();
+  await putUploadRecord({
+    id,
+    name: "",
+    size: 0,
+    mimeType: "application/octet-stream",
+    blob: null,
+    uploadUrl: "",
+    status: "cancelled",
+    progress: 0,
+    attempts: 0,
+    createdAt: now,
+    updatedAt: now,
+    lockedUntil: 0,
+    cancelledUntil: now + CANCELLED_UPLOAD_TOMBSTONE_MS,
+    lastError: "",
+  });
 }
 
 export async function requestBackgroundFetchUpload(registration, record) {
@@ -193,12 +218,57 @@ export function uploadRecordToView(record) {
 
 async function getUploadRecord(id) {
   const db = await openDb();
-  return requestAsPromise(db.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).get(id));
+  const record = await requestAsPromise(db.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).get(id));
+  if (!isAnyCancelledUploadRecord(record)) return record;
+  if (isExpiredCancelledUploadRecord(record)) deleteUploadRecords([id]).catch(() => {});
+  return null;
 }
 
 async function putUploadRecord(record) {
   const db = await openDb();
-  await requestAsPromise(db.transaction(STORE_NAME, "readwrite").objectStore(STORE_NAME).put(record));
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(STORE_NAME, "readwrite");
+    const store = transaction.objectStore(STORE_NAME);
+    let stored = false;
+    transaction.oncomplete = () => resolve(stored);
+    transaction.onerror = () => reject(transaction.error || new Error("IndexedDB transaction failed"));
+    transaction.onabort = () => reject(transaction.error || new Error("IndexedDB transaction aborted"));
+    const request = store.get(record.id);
+    request.onsuccess = () => {
+      if (record.status !== "cancelled" && isCancelledUploadRecord(request.result)) return;
+      store.put(record);
+      stored = true;
+    };
+    request.onerror = () => reject(request.error || new Error("IndexedDB request failed"));
+  });
+}
+
+async function deleteUploadRecords(ids) {
+  const db = await openDb();
+  await new Promise((resolve, reject) => {
+    const transaction = db.transaction(STORE_NAME, "readwrite");
+    const store = transaction.objectStore(STORE_NAME);
+    transaction.oncomplete = resolve;
+    transaction.onerror = () => reject(transaction.error || new Error("IndexedDB transaction failed"));
+    transaction.onabort = () => reject(transaction.error || new Error("IndexedDB transaction aborted"));
+    ids.forEach((id) => store.delete(id));
+  });
+}
+
+function isAnyCancelledUploadRecord(record) {
+  return record?.status === "cancelled";
+}
+
+function isCancelledUploadRecord(record, now = Date.now()) {
+  if (!isAnyCancelledUploadRecord(record)) return false;
+  const cancelledUntil = Number(record.cancelledUntil || 0);
+  return !cancelledUntil || cancelledUntil > now;
+}
+
+function isExpiredCancelledUploadRecord(record, now = Date.now()) {
+  if (!isAnyCancelledUploadRecord(record)) return false;
+  const cancelledUntil = Number(record.cancelledUntil || 0);
+  return Boolean(cancelledUntil && cancelledUntil <= now);
 }
 
 function openDb() {

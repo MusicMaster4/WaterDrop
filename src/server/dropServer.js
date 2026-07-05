@@ -123,6 +123,7 @@ class FileStore extends EventEmitter {
   }
 
   addPendingUpload({ id, name, size }) {
+    if (this.isDeletedUpload(id)) return null;
     this.clearPendingUpload(id);
     const entry = {
       id,
@@ -154,6 +155,7 @@ class FileStore extends EventEmitter {
 
   listPendingUploads() {
     return Array.from(this.pendingUploads.values())
+      .filter((entry) => !this.isDeletedUpload(entry.id))
       .sort((a, b) => b.createdAt - a.createdAt)
       .map((entry) => ({
         id: entry.id,
@@ -288,6 +290,37 @@ class FileStore extends EventEmitter {
         changed = true;
       }
     }
+    return changed;
+  }
+
+  listDeletedUploadIds() {
+    if (this.cleanupDeletedUploads()) {
+      this.saveDeletedUploads().catch((err) => console.error("Could not save deleted upload metadata", err));
+    }
+    return Object.keys(this.deletedUploads);
+  }
+
+  async cancelInFlightUploads(ids, reason = "upload-deleted") {
+    const uniqueIds = Array.from(new Set(ids.filter(isValidFileId)));
+    let changed = false;
+    for (const id of uniqueIds) {
+      changed = this.clearPendingUpload(id) || changed;
+      const session = this.uploadSessions.get(id);
+      if (session) {
+        clearTimeout(session.timer);
+        this.uploadSessions.delete(id);
+        try {
+          await session.ready;
+        } catch {}
+        try {
+          await removeIfExists(session.tempPath);
+        } catch (err) {
+          console.error("Could not remove cancelled upload temp file", err);
+        }
+        changed = true;
+      }
+    }
+    if (changed) this.notifyFilesChanged(reason);
     return changed;
   }
 
@@ -439,6 +472,7 @@ class FileStore extends EventEmitter {
     if (index === -1) return false;
     const [file] = this.files.splice(index, 1);
     const payloads = file.kind === "folder" ? this.files.filter((entry) => entry.folderId === file.id) : [file];
+    const deletedIds = [file.id, ...payloads.map((entry) => entry.id)];
     if (file.kind === "folder") {
       this.files = this.files.filter((entry) => entry.folderId !== file.id);
     }
@@ -450,20 +484,27 @@ class FileStore extends EventEmitter {
     );
     await removeDirIfExists(path.join(this.dragDir, file.id));
     await this.saveFiles();
-    await this.rememberDeletedUploads([file.id, ...payloads.map((entry) => entry.id)]);
+    await this.rememberDeletedUploads(deletedIds);
+    await this.cancelInFlightUploads(deletedIds);
     this.notifyFilesChanged("delete");
     return true;
   }
 
   async clear() {
     const files = this.files;
+    const deletedIds = [
+      ...files.map((file) => file.id),
+      ...Array.from(this.pendingUploads.keys()),
+      ...Array.from(this.uploadSessions.keys()),
+    ];
     this.files = [];
     await Promise.all(files.filter((file) => file.kind !== "folder").map((file) => removeIfExists(this.pathFor(file))));
     await removeDirIfExists(this.dragDir);
     await fsp.mkdir(this.dragDir, { recursive: true });
     await this.saveFiles();
-    await this.rememberDeletedUploads(files.map((file) => file.id));
-    if (files.length) this.notifyFilesChanged("clear");
+    await this.rememberDeletedUploads(deletedIds);
+    await this.cancelInFlightUploads(deletedIds);
+    if (files.length || deletedIds.length) this.notifyFilesChanged("clear");
     return files.filter((file) => !file.folderId).length;
   }
 
@@ -706,7 +747,12 @@ async function handleApi({ req, res, relative, store, getPort, getHttpsPort, eve
 
   if (req.method === "GET" && relative === "/api/files") {
     await store.cleanupExpired();
-    sendJson(res, 200, { files: store.list(), pending: store.listPendingUploads(), settings: store.settings });
+    sendJson(res, 200, {
+      files: store.list(),
+      pending: store.listPendingUploads(),
+      deletedUploads: store.listDeletedUploadIds(),
+      settings: store.settings,
+    });
     return;
   }
 

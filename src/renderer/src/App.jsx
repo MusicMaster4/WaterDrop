@@ -159,14 +159,16 @@ export default function App() {
       const result = await api.getFiles();
       const nextFiles = result.files || [];
       const landedIds = nextFiles.map((file) => file.id).filter(Boolean);
-      if (landedIds.length && isUploadQueueSupported()) {
-        Promise.allSettled(landedIds.map((id) => clearQueuedUpload(id))).catch(() => {});
+      const deletedUploadIds = Array.isArray(result.deletedUploads) ? result.deletedUploads.filter(Boolean) : [];
+      const closedIds = Array.from(new Set([...landedIds, ...deletedUploadIds]));
+      if (closedIds.length && isUploadQueueSupported()) {
+        Promise.allSettled(closedIds.map((id) => clearQueuedUpload(id))).catch(() => {});
         setUploads((items) =>
-          items.filter((item) => !item.queued || !landedIds.includes(item.id))
+          items.filter((item) => !item.queued || !closedIds.includes(item.id))
         );
       }
       setFiles(nextFiles);
-      setPending(result.pending || []);
+      setPending((result.pending || []).filter((item) => !closedIds.includes(item.id)));
       setSettings(result.settings || {});
     } catch (err) {
       if (!silent) notify(err.message || "Could not refresh files", "warn");
@@ -217,17 +219,18 @@ export default function App() {
     if (!registration?.backgroundFetch?.fetch) return false;
     try {
       const syncing = await markQueuedUploadSyncing(record.id);
-      const bgFetch = await requestBackgroundFetchUpload(registration, syncing || record);
+      if (!syncing) return false;
+      const bgFetch = await requestBackgroundFetchUpload(registration, syncing);
       if (!bgFetch) return false;
       setUploads((items) =>
-        upsertUpload(items, { ...uploadRecordToView(syncing || record), status: "syncing", progress: 1 })
+        upsertUpload(items, { ...uploadRecordToView(syncing), status: "syncing", progress: 1 })
       );
       bgFetch.addEventListener?.("progress", () => {
         const total = Number(bgFetch.uploadTotal || 0);
         if (!total) return;
         const progress = Math.max(1, Math.min(99, Math.round((bgFetch.uploaded / total) * 100)));
         setUploads((items) =>
-          upsertUpload(items, { ...uploadRecordToView(syncing || record), status: "syncing", progress })
+          upsertUpload(items, { ...uploadRecordToView(syncing), status: "syncing", progress })
         );
       });
       return true;
@@ -315,8 +318,7 @@ export default function App() {
     const onMessage = (event) => {
       const type = event.data?.type || "";
       if (!type.startsWith("WATERDROP_UPLOAD_")) return;
-      refreshQueuedUploads();
-      refreshFiles({ silent: true });
+      refreshFiles({ silent: true }).then(refreshQueuedUploads);
     };
     navigator.serviceWorker.addEventListener("message", onMessage);
     return () => {
@@ -352,8 +354,7 @@ export default function App() {
   useEffect(() => {
     if (busy) return;
     refreshInfo();
-    refreshFiles();
-    refreshQueuedUploads().then(drainQueuedUploads);
+    refreshFiles().then(refreshQueuedUploads).then(drainQueuedUploads);
   }, [busy, drainQueuedUploads, refreshFiles, refreshInfo, refreshQueuedUploads]);
 
   // Probe the direct HTTPS origin. If a phone can reach it, route bulk transfers
@@ -399,7 +400,7 @@ export default function App() {
     const refreshQuietly = () => refreshFiles({ silent: true });
     const retryUploadsQuietly = () => {
       registerBackgroundUpload();
-      refreshQueuedUploads().then(drainQueuedUploads);
+      refreshFiles({ silent: true }).then(refreshQueuedUploads).then(drainQueuedUploads);
     };
     const refreshInterval = window.setInterval(refreshQuietly, window.EventSource ? 15000 : 3000);
     const uploadRetryInterval = window.setInterval(retryUploadsQuietly, 15000);

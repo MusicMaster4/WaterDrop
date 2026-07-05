@@ -252,6 +252,8 @@ test("deleted uploads are not recreated by stale queued retries", async () => {
 
     const afterRetry = await (await fetch(new URL("api/files", server.localUrl))).json();
     assert.equal(afterRetry.files.length, 0);
+    assert.equal(afterRetry.pending.length, 0);
+    assert.equal(afterRetry.deletedUploads.includes(id), true);
 
     await server.close();
     server = null;
@@ -274,8 +276,51 @@ test("deleted uploads are not recreated by stale queued retries", async () => {
 
     const afterRestartRetry = await (await fetch(new URL("api/files", server.localUrl))).json();
     assert.equal(afterRestartRetry.files.length, 0);
+    assert.equal(afterRestartRetry.pending.length, 0);
+    assert.equal(afterRestartRetry.deletedUploads.includes(id), true);
   } finally {
     await server?.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("deleting a file clears matching in-flight upload placeholders", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-delete-pending-test-"));
+  const rendererDir = path.join(root, "renderer");
+  const dataDir = path.join(root, "data");
+  const downloads = path.join(root, "downloads");
+  await fs.mkdir(rendererDir, { recursive: true });
+  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>WaterDrop</title>");
+
+  const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 48030 });
+  try {
+    const id = "66666666-6666-4666-8666-666666666666";
+    const upload = await fetch(new URL("api/files/raw", server.localUrl), {
+      method: "POST",
+      body: new Blob(["done"], { type: "text/plain" }),
+      headers: {
+        "Content-Type": "text/plain",
+        "X-WaterDrop-File-Name": encodeURIComponent("done.txt"),
+        "X-WaterDrop-Mime-Type": "text/plain",
+        "X-WaterDrop-Upload-Id": id,
+      },
+    });
+    assert.equal(upload.status, 201);
+
+    server.store.addPendingUpload({ id, name: "done.txt", size: 4096 });
+    const beforeDelete = await (await fetch(new URL("api/files", server.localUrl))).json();
+    assert.equal(beforeDelete.files.length, 1);
+    assert.equal(beforeDelete.pending.length, 1);
+
+    const deleted = await fetch(new URL(`api/files/${id}`, server.localUrl), { method: "DELETE" });
+    assert.equal(deleted.status, 200);
+
+    const afterDelete = await (await fetch(new URL("api/files", server.localUrl))).json();
+    assert.equal(afterDelete.files.length, 0);
+    assert.equal(afterDelete.pending.length, 0);
+    assert.equal(afterDelete.deletedUploads.includes(id), true);
+  } finally {
+    await server.close();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
