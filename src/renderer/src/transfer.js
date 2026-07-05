@@ -128,6 +128,7 @@ export async function parallelUpload({
   const chunkProgress = new Array(chunkCount).fill(0);
   let nextIndex = 0;
   let resultFile = null;
+  let deleted = false;
 
   const reportProgress = () => {
     const uploadedBytes = chunkProgress.reduce((sum, bytes) => sum + bytes, 0);
@@ -207,6 +208,7 @@ export async function parallelUpload({
       const start = index * UPLOAD_CHUNK_SIZE;
       const end = Math.min(size, start + UPLOAD_CHUNK_SIZE);
       const data = await uploadChunk(index, start, end);
+      if (data?.deleted) deleted = true;
       if (data && Array.isArray(data.files) && data.files.length) resultFile = data.files[0];
     }
   }
@@ -216,5 +218,6 @@ export async function parallelUpload({
   for (let i = 0; i < parallel; i += 1) workers.push(worker());
   await Promise.all(workers);
 
+  if (deleted) return { deleted: true };
   return resultFile;
 }

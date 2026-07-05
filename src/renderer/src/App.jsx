@@ -157,7 +157,15 @@ export default function App() {
   const refreshFiles = useCallback(async ({ silent = false } = {}) => {
     try {
       const result = await api.getFiles();
-      setFiles(result.files || []);
+      const nextFiles = result.files || [];
+      const landedIds = nextFiles.map((file) => file.id).filter(Boolean);
+      if (landedIds.length && isUploadQueueSupported()) {
+        Promise.allSettled(landedIds.map((id) => clearQueuedUpload(id))).catch(() => {});
+        setUploads((items) =>
+          items.filter((item) => !item.queued || !landedIds.includes(item.id))
+        );
+      }
+      setFiles(nextFiles);
       setPending(result.pending || []);
       setSettings(result.settings || {});
     } catch (err) {
@@ -809,7 +817,12 @@ export default function App() {
 
   async function clearFiles() {
     try {
+      const deletedIds = files.map((file) => file.id);
       const result = await api.clearFiles();
+      if (isUploadQueueSupported()) {
+        await Promise.allSettled(deletedIds.map((id) => clearQueuedUpload(id)));
+      }
+      setUploads((items) => items.filter((item) => !deletedIds.includes(item.id)));
       setConfirmClear(false);
       setConfirmDelete(null);
       setPreviewFile(null);
@@ -823,6 +836,10 @@ export default function App() {
   async function deleteFile(file) {
     try {
       await api.deleteFile(file.id);
+      if (isUploadQueueSupported()) {
+        await clearQueuedUpload(file.id).catch(() => {});
+      }
+      setUploads((items) => items.filter((item) => item.id !== file.id));
       setConfirmDelete(null);
       notify("Deleted", "ok");
       await refreshFiles();
@@ -1856,7 +1873,7 @@ async function uploadQueuedRecord({
   }, Math.max(5000, Math.floor(PAGE_UPLOAD_LOCK_MS / 3)));
 
   try {
-    await new Promise((resolve, reject) => {
+    const result = await new Promise((resolve, reject) => {
       let settled = false;
       let lastActivityAt = Date.now();
       let activeXhr = null;
@@ -1933,7 +1950,7 @@ async function uploadQueuedRecord({
           onProgress: applyProgress,
           onActivity: markActivity,
         })
-          .then(() => settle(resolve))
+          .then((result) => settle(resolve, result))
           .catch((err) => settle(reject, err instanceof Error ? err : new Error(String(err))));
       } else {
         // Small file: a single streamed request is already optimal.
@@ -1953,7 +1970,8 @@ async function uploadQueuedRecord({
         xhr.upload.onload = markActivity;
         xhr.onload = () => {
           if (xhr.status >= 200 && xhr.status < 300) {
-            settle(resolve);
+            const data = parseJsonResponse(xhr.responseText);
+            settle(resolve, data);
             return;
           }
           settle(reject, new Error(`HTTP ${xhr.status}`));
@@ -1965,6 +1983,11 @@ async function uploadQueuedRecord({
     });
 
     await clearQueuedUpload(record.id);
+    if (result?.deleted) {
+      setUploads((items) => items.filter((item) => item.id !== record.id));
+      await refreshFiles({ silent: true });
+      return;
+    }
     setUploads((items) => upsertUpload(items, { ...view, queued: false, status: "done", progress: 100 }));
     window.setTimeout(() => {
       setUploads((items) => items.filter((item) => item.id !== record.id));
@@ -1977,6 +2000,15 @@ async function uploadQueuedRecord({
     notifyUploadPaused?.();
   } finally {
     window.clearInterval(lockTimer);
+  }
+}
+
+function parseJsonResponse(text) {
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return {};
   }
 }
 
