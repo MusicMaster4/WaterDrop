@@ -44,6 +44,7 @@ import {
   markQueuedUploadSyncing,
   queueUpload,
   recoverInterruptedUploads,
+  releaseQueuedUpload,
   requestBackgroundFetchUpload,
   requestBackgroundUploadSync,
   touchQueuedUploadLock,
@@ -221,7 +222,10 @@ export default function App() {
       const syncing = await markQueuedUploadSyncing(record.id);
       if (!syncing) return false;
       const bgFetch = await requestBackgroundFetchUpload(registration, syncing);
-      if (!bgFetch) return false;
+      if (!bgFetch) {
+        await releaseQueuedUpload(record.id, "Background fetch unavailable").catch(() => {});
+        return false;
+      }
       setUploads((items) =>
         upsertUpload(items, { ...uploadRecordToView(syncing), status: "syncing", progress: 1 })
       );
@@ -256,7 +260,11 @@ export default function App() {
             ?.get(record.id)
             .catch(() => null);
           if (activeBackgroundFetch) continue;
-          const claimed = await claimQueuedUpload(record.id);
+          const forceClaim = record.status === "syncing";
+          if (forceClaim) {
+            await releaseQueuedUpload(record.id, "Background fetch did not start").catch(() => {});
+          }
+          const claimed = await claimQueuedUpload(record.id, { force: forceClaim });
           if (!claimed) continue;
           await uploadQueuedRecord({
             api,

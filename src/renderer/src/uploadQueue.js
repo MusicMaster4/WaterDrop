@@ -75,11 +75,11 @@ export async function recoverInterruptedUploads(message = "Upload interrupted") 
   return recovered;
 }
 
-export async function claimQueuedUpload(id) {
+export async function claimQueuedUpload(id, { force = false } = {}) {
   const record = await getUploadRecord(id);
   if (!record) return null;
   const now = Date.now();
-  if (record.lockedUntil > now && ["uploading", "syncing"].includes(record.status)) {
+  if (!force && record.lockedUntil > now && ["uploading", "syncing"].includes(record.status)) {
     return null;
   }
   const claimed = {
@@ -91,6 +91,20 @@ export async function claimQueuedUpload(id) {
     lastError: "",
   };
   return await putUploadRecord(claimed) ? claimed : null;
+}
+
+export async function releaseQueuedUpload(id, message = "") {
+  const record = await getUploadRecord(id);
+  if (!record) return null;
+  const released = {
+    ...record,
+    status: "queued",
+    progress: Math.max(1, Number(record.progress || 0)),
+    updatedAt: Date.now(),
+    lockedUntil: 0,
+    lastError: message || record.lastError || "",
+  };
+  return await putUploadRecord(released) ? released : null;
 }
 
 export async function touchQueuedUploadLock(id) {
