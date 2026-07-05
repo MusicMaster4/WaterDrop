@@ -560,6 +560,52 @@ body::before {
   font-size: 1rem;
 }
 
+.bulk-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 10px 12px;
+  cursor: pointer;
+}
+.bulk-toggle input {
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  border-radius: 5px;
+  border: 1px solid var(--line-strong);
+  background: var(--panel-solid);
+  position: relative;
+}
+.bulk-toggle input:checked {
+  background: var(--ink);
+  border-color: var(--ink);
+}
+.bulk-toggle input:checked::after {
+  content: "";
+  position: absolute;
+  left: 5px;
+  top: 2px;
+  width: 5px;
+  height: 9px;
+  border: solid #08080a;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.bulk-title {
+  display: block;
+  color: var(--text);
+  font-weight: 700;
+  line-height: 1.2;
+}
+.bulk-sub {
+  display: block;
+  margin-top: 2px;
+}
+
 /* ---- Upload progress ---- */
 .uploads {
   display: flex;
@@ -675,6 +721,12 @@ body::before {
 .file:hover {
   border-color: var(--line-strong);
   background: var(--panel-strong);
+}
+.file-folder .file-tile {
+  color: var(--ink);
+  background:
+    linear-gradient(135deg, rgba(143, 184, 154, 0.13), transparent 45%),
+    var(--panel-strong);
 }
 .file:focus-visible {
   outline: 2px solid var(--ink);
@@ -989,6 +1041,39 @@ body::before {
   padding: 24px;
   color: var(--muted);
   text-align: center;
+}
+
+.folder-preview-list {
+  width: min(620px, calc(100% - 28px));
+  max-height: min(58vh, 540px);
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+.folder-preview-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.folder-preview-row:last-child {
+  border-bottom: none;
+}
+.folder-preview-row svg {
+  color: var(--silver);
+}
+.folder-preview-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-weight: 600;
 }
 
 .context-menu {

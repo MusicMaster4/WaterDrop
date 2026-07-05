@@ -18,6 +18,7 @@ import {
   Info,
   MonitorUp,
   MoreHorizontal,
+  Pencil,
   QrCode,
   RefreshCw,
   Server,
@@ -43,12 +44,19 @@ import {
   markQueuedUploadSyncing,
   queueUpload,
   recoverInterruptedUploads,
+  releaseQueuedUpload,
   requestBackgroundFetchUpload,
   requestBackgroundUploadSync,
   touchQueuedUploadLock,
   updateQueuedUploadProgress,
   uploadRecordToView,
 } from "./uploadQueue";
+import {
+  canParallelDownload,
+  canParallelUpload,
+  parallelDownload,
+  parallelUpload,
+} from "./transfer";
 
 const TAILSCALE_URL = "https://tailscale.com/download";
 const TAILSCALE_IOS_URL = "https://apps.apple.com/app/tailscale/id1470499037";
@@ -58,6 +66,9 @@ const TAILSCALE_ANDROID_URL = "https://play.google.com/store/apps/details?id=com
 const ONBOARDING_STEPS = ["Welcome", "This PC", "Phone", "Publish", "Finish"];
 const LAST_ONBOARD_STEP = ONBOARDING_STEPS.length - 1;
 const UPLOAD_STALL_MS = Math.max(90 * 1000, STALE_UPLOAD_LOCK_MS);
+// Drain several queued files at once instead of strictly one-at-a-time; large
+// files also fan out internally into parallel chunks.
+const MAX_CONCURRENT_UPLOADS = 3;
 
 const apiDefault = {
   getInfo: () => request("api/info"),
@@ -67,6 +78,8 @@ const apiDefault = {
   rawUploadUrl: "api/files/raw",
   downloadUrl: (id) => `api/files/${id}/download`,
   previewUrl: (id) => `api/files/${id}/preview`,
+  createFolder: (name) => request("api/folders", { method: "POST", body: JSON.stringify({ name }) }),
+  renameFolder: (id, name) => request(`api/folders/${id}`, { method: "PATCH", body: JSON.stringify({ name }) }),
   clearFiles: () => request("api/files", { method: "DELETE" }),
   deleteFile: (id) => request(`api/files/${id}`, { method: "DELETE" }),
   configureServe: () => request("api/tailscale/serve", { method: "POST" }),
@@ -83,6 +96,8 @@ function buildApi(baseUrl = "") {
     rawUploadUrl: join("api/files/raw"),
     downloadUrl: (id) => join(`api/files/${id}/download`),
     previewUrl: (id) => join(`api/files/${id}/preview`),
+    createFolder: (name) => request(join("api/folders"), { method: "POST", body: JSON.stringify({ name }) }),
+    renameFolder: (id, name) => request(join(`api/folders/${id}`), { method: "PATCH", body: JSON.stringify({ name }) }),
     clearFiles: () => request(join("api/files"), { method: "DELETE" }),
     deleteFile: (id) => request(join(`api/files/${id}`), { method: "DELETE" }),
     configureServe: () => request(join("api/tailscale/serve"), { method: "POST" }),
@@ -97,6 +112,11 @@ export default function App() {
   const serviceWorkerRegistrationRef = useRef(null);
   const drainingUploadsRef = useRef(false);
   const lastUploadPauseNoticeRef = useRef(0);
+  // When the direct HTTPS origin is reachable, bulk transfers are routed through
+  // it (HTTP/1.1 -> real parallel connections). Null means "use this page's
+  // origin" (e.g. Tailscale Serve). Held in a ref so it can change mid-session
+  // without rebuilding upload callbacks.
+  const transferBaseRef = useRef(null);
   const [api, setApi] = useState(apiDefault);
   const [appInfo, setAppInfo] = useState(null);
   const [info, setInfo] = useState(null);
@@ -104,6 +124,7 @@ export default function App() {
   const [pending, setPending] = useState([]);
   const [settings, setSettings] = useState({});
   const [uploads, setUploads] = useState([]);
+  const [createFolderUpload, setCreateFolderUpload] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(true);
   const [qrOpen, setQrOpen] = useState(false);
@@ -137,8 +158,18 @@ export default function App() {
   const refreshFiles = useCallback(async ({ silent = false } = {}) => {
     try {
       const result = await api.getFiles();
-      setFiles(result.files || []);
-      setPending(result.pending || []);
+      const nextFiles = result.files || [];
+      const landedIds = nextFiles.map((file) => file.id).filter(Boolean);
+      const deletedUploadIds = Array.isArray(result.deletedUploads) ? result.deletedUploads.filter(Boolean) : [];
+      const closedIds = Array.from(new Set([...landedIds, ...deletedUploadIds]));
+      if (closedIds.length && isUploadQueueSupported()) {
+        Promise.allSettled(closedIds.map((id) => clearQueuedUpload(id))).catch(() => {});
+        setUploads((items) =>
+          items.filter((item) => !item.queued || !closedIds.includes(item.id))
+        );
+      }
+      setFiles(nextFiles);
+      setPending((result.pending || []).filter((item) => !closedIds.includes(item.id)));
       setSettings(result.settings || {});
     } catch (err) {
       if (!silent) notify(err.message || "Could not refresh files", "warn");
@@ -189,17 +220,21 @@ export default function App() {
     if (!registration?.backgroundFetch?.fetch) return false;
     try {
       const syncing = await markQueuedUploadSyncing(record.id);
-      const bgFetch = await requestBackgroundFetchUpload(registration, syncing || record);
-      if (!bgFetch) return false;
+      if (!syncing) return false;
+      const bgFetch = await requestBackgroundFetchUpload(registration, syncing);
+      if (!bgFetch) {
+        await releaseQueuedUpload(record.id, "Background fetch unavailable").catch(() => {});
+        return false;
+      }
       setUploads((items) =>
-        upsertUpload(items, { ...uploadRecordToView(syncing || record), status: "syncing", progress: 1 })
+        upsertUpload(items, { ...uploadRecordToView(syncing), status: "syncing", progress: 1 })
       );
       bgFetch.addEventListener?.("progress", () => {
         const total = Number(bgFetch.uploadTotal || 0);
         if (!total) return;
         const progress = Math.max(1, Math.min(99, Math.round((bgFetch.uploaded / total) * 100)));
         setUploads((items) =>
-          upsertUpload(items, { ...uploadRecordToView(syncing || record), status: "syncing", progress })
+          upsertUpload(items, { ...uploadRecordToView(syncing), status: "syncing", progress })
         );
       });
       return true;
@@ -215,22 +250,38 @@ export default function App() {
     try {
       await recoverInterruptedUploads("Upload interrupted by app suspend");
       const records = await listQueuedUploads();
-      for (const record of records) {
-        const activeBackgroundFetch = await serviceWorkerRegistrationRef.current?.backgroundFetch
-          ?.get(record.id)
-          .catch(() => null);
-        if (activeBackgroundFetch) continue;
-        const claimed = await claimQueuedUpload(record.id);
-        if (!claimed) continue;
-        await uploadQueuedRecord({
-          api,
-          record: claimed,
-          notifyUploadPaused,
-          refreshFiles,
-          registerBackgroundUpload,
-          setUploads,
-        });
-      }
+      // Drain several files at once from a shared queue; claimQueuedUpload keeps
+      // any one record from being picked up twice.
+      const queue = [...records];
+      const runNext = async () => {
+        while (queue.length) {
+          const record = queue.shift();
+          const activeBackgroundFetch = await serviceWorkerRegistrationRef.current?.backgroundFetch
+            ?.get(record.id)
+            .catch(() => null);
+          if (activeBackgroundFetch) continue;
+          const forceClaim = record.status === "syncing";
+          if (forceClaim) {
+            await releaseQueuedUpload(record.id, "Background fetch did not start").catch(() => {});
+          }
+          const claimed = await claimQueuedUpload(record.id, { force: forceClaim });
+          if (!claimed) continue;
+          await uploadQueuedRecord({
+            api,
+            record: claimed,
+            transferBase: transferBaseRef.current,
+            notifyUploadPaused,
+            refreshFiles,
+            registerBackgroundUpload,
+            setUploads,
+          });
+        }
+      };
+      const pool = Array.from(
+        { length: Math.min(MAX_CONCURRENT_UPLOADS, queue.length) },
+        () => runNext()
+      );
+      await Promise.all(pool);
     } finally {
       drainingUploadsRef.current = false;
       await refreshQueuedUploads();
@@ -275,8 +326,7 @@ export default function App() {
     const onMessage = (event) => {
       const type = event.data?.type || "";
       if (!type.startsWith("WATERDROP_UPLOAD_")) return;
-      refreshQueuedUploads();
-      refreshFiles({ silent: true });
+      refreshFiles({ silent: true }).then(refreshQueuedUploads);
     };
     navigator.serviceWorker.addEventListener("message", onMessage);
     return () => {
@@ -312,16 +362,53 @@ export default function App() {
   useEffect(() => {
     if (busy) return;
     refreshInfo();
-    refreshFiles();
-    refreshQueuedUploads().then(drainQueuedUploads);
+    refreshFiles().then(refreshQueuedUploads).then(drainQueuedUploads);
   }, [busy, drainQueuedUploads, refreshFiles, refreshInfo, refreshQueuedUploads]);
+
+  // Probe the direct HTTPS origin. If a phone can reach it, route bulk transfers
+  // there for real parallel (HTTP/1.1) connections; otherwise stay on this page's
+  // origin (e.g. Tailscale Serve) so nothing breaks.
+  const directTransferUrl = info?.network?.httpsDirectUrl || null;
+  useEffect(() => {
+    if (isDesktop || !directTransferUrl) {
+      transferBaseRef.current = null;
+      return undefined;
+    }
+    let directOrigin;
+    try {
+      directOrigin = new URL(directTransferUrl).origin;
+    } catch {
+      transferBaseRef.current = null;
+      return undefined;
+    }
+    if (directOrigin === window.location.origin) {
+      transferBaseRef.current = directTransferUrl;
+      return undefined;
+    }
+    let cancelled = false;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 3500);
+    fetch(new URL("api/ping", directTransferUrl), { cache: "no-store", signal: controller.signal })
+      .then((res) => {
+        if (!cancelled) transferBaseRef.current = res.ok ? directTransferUrl : null;
+      })
+      .catch(() => {
+        if (!cancelled) transferBaseRef.current = null;
+      })
+      .finally(() => window.clearTimeout(timer));
+    return () => {
+      cancelled = true;
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [directTransferUrl, isDesktop]);
 
   useEffect(() => {
     if (busy) return undefined;
     const refreshQuietly = () => refreshFiles({ silent: true });
     const retryUploadsQuietly = () => {
       registerBackgroundUpload();
-      refreshQueuedUploads().then(drainQueuedUploads);
+      refreshFiles({ silent: true }).then(refreshQueuedUploads).then(drainQueuedUploads);
     };
     const refreshInterval = window.setInterval(refreshQuietly, window.EventSource ? 15000 : 3000);
     const uploadRetryInterval = window.setInterval(retryUploadsQuietly, 15000);
@@ -528,8 +615,19 @@ export default function App() {
   async function uploadFiles(picked) {
     const valid = picked.filter(Boolean);
     if (!valid.length) return;
+    let targetFolder = null;
+    if (createFolderUpload) {
+      try {
+        const result = await api.createFolder();
+        targetFolder = result.folder;
+        await refreshFiles({ silent: true });
+      } catch (err) {
+        notify(err.message || "Could not create folder", "warn");
+        return;
+      }
+    }
     if (!api.rawUploadUrl || !isUploadQueueSupported()) {
-      valid.forEach((file) => uploadOneLegacy(file));
+      valid.forEach((file) => uploadOneLegacy(file, targetFolder));
       return;
     }
 
@@ -537,27 +635,34 @@ export default function App() {
     let browserBackground = 0;
     for (const file of valid) {
       try {
-        const record = await queueUpload(file, api.rawUploadUrl);
+        const record = await queueUpload(file, api.rawUploadUrl, {
+          folderId: targetFolder?.id,
+          folderName: targetFolder?.name,
+        });
         queued += 1;
-        setUploads((items) => upsertUpload(items, uploadRecordToView(record)));
+        setUploads((items) =>
+          upsertUpload(items, { ...uploadRecordToView(record), progress: 1 })
+        );
         if (await startBackgroundFetchUpload(record)) {
           browserBackground += 1;
         }
       } catch (err) {
         notify(err.message || `Could not queue ${file.name}`, "warn");
-        uploadOneLegacy(file);
+        uploadOneLegacy(file, targetFolder);
       }
     }
 
     if (queued > 0) {
       const hasBackgroundSync = await registerBackgroundUpload();
       notify(
-        browserBackground > 0
+        targetFolder
+          ? `${valid.length} files queued in ${targetFolder.name}.`
+          : browserBackground > 0
           ? "Upload handed to the browser background task."
           : hasBackgroundSync
           ? "Upload queued for background retry."
           : "Upload queued. It resumes when this page is open.",
-        browserBackground > 0 || hasBackgroundSync ? "ok" : "info"
+        targetFolder || browserBackground > 0 || hasBackgroundSync ? "ok" : "info"
       );
       if (browserBackground < queued) drainQueuedUploads();
     }
@@ -576,11 +681,11 @@ export default function App() {
     setUploads((items) => items.filter((item) => item.id !== upload.id));
   }
 
-  function uploadOneLegacy(file) {
+  function uploadOneLegacy(file, targetFolder = null) {
     const id = crypto.randomUUID();
     setUploads((items) => [
       ...items,
-      { id, name: file.name, size: file.size, progress: 0, status: "uploading", createdAt: Date.now() },
+      { id, name: file.name, size: file.size, progress: 1, status: "uploading", createdAt: Date.now() },
     ]);
 
     const xhr = new XMLHttpRequest();
@@ -591,10 +696,11 @@ export default function App() {
       xhr.setRequestHeader("X-WaterDrop-File-Name", encodeURIComponent(file.name || "unnamed-file"));
       xhr.setRequestHeader("X-WaterDrop-Mime-Type", file.type || "application/octet-stream");
       xhr.setRequestHeader("X-WaterDrop-Upload-Id", id);
+      if (targetFolder?.id) xhr.setRequestHeader("X-WaterDrop-Folder-Id", targetFolder.id);
     }
     xhr.upload.onprogress = (event) => {
       if (!event.lengthComputable) return;
-      const progress = Math.round((event.loaded / event.total) * 100);
+      const progress = Math.max(1, Math.min(99, Math.round((event.loaded / event.total) * 100)));
       setUploads((items) =>
         items.map((item) => (item.id === id ? { ...item, progress } : item))
       );
@@ -634,7 +740,7 @@ export default function App() {
     if (window.waterdrop) {
       const result = await window.waterdrop.saveFile(file.id);
       if (result.ok) {
-        notify("Saved to folder", "ok", {
+        notify(isFolderEntry(file) ? "ZIP saved to folder" : "Saved to folder", "ok", {
           label: "Reveal",
           run: () => window.waterdrop.revealPath(result.destination),
         });
@@ -644,12 +750,70 @@ export default function App() {
       notify(result.message || "Save failed", "warn");
       return;
     }
-    window.location.href = api.downloadUrl(file.id);
-    window.setTimeout(refreshFiles, 1000);
+    await browserDownload(file);
+  }
+
+  function shouldAccelerateDownload(file) {
+    return !isFolderEntry(file) && canParallelDownload(file);
+  }
+
+  // Accelerated multi-connection download with a plain native download as the
+  // fallback for folders, small files, unsupported browsers, or any error.
+  async function browserDownload(file) {
+    if (shouldAccelerateDownload(file)) {
+      let lastPct = -100;
+      const base = transferBaseRef.current;
+      const url = base ? new URL(`api/files/${file.id}/download`, base).toString() : api.downloadUrl(file.id);
+      try {
+        notify(`Downloading ${file.name}…`, "info");
+        await parallelDownload(file, url, {
+          onProgress: (pct) => {
+            if (pct - lastPct >= 10) {
+              lastPct = pct;
+              notify(`Downloading ${file.name} — ${pct}%`, "info");
+            }
+          },
+        });
+        notify("Download complete", "ok");
+        window.setTimeout(() => refreshFiles({ silent: true }), 500);
+        return;
+      } catch {
+        // Fall through to the native download below.
+      }
+    }
+    nativeDownload(file);
+  }
+
+  function nativeDownload(file) {
+    const anchor = document.createElement("a");
+    anchor.href = api.downloadUrl(file.id);
+    anchor.download = file.name || "download";
+    anchor.rel = "noopener";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => refreshFiles({ silent: true }), 1000);
+  }
+
+  async function renameFolder(file) {
+    if (!isFolderEntry(file)) return;
+    const nextName = window.prompt("Folder name", file.name);
+    if (nextName === null) return;
+    const trimmed = nextName.trim();
+    if (!trimmed || trimmed === file.name) return;
+    try {
+      const result = await api.renameFolder(file.id, trimmed);
+      setFiles((items) => items.map((item) => (item.id === file.id ? result.folder : item)));
+      if (previewFile?.id === file.id) setPreviewFile(result.folder);
+      notify("Folder renamed", "ok");
+    } catch (err) {
+      notify(err.message || "Rename failed", "warn");
+    }
   }
 
   function startExternalDrag(file, event) {
     if (!window.waterdrop?.startFileDrag) return;
+    if (isFolderEntry(file)) return;
     event.preventDefault();
     event.stopPropagation();
     if (event.dataTransfer) {
@@ -662,7 +826,12 @@ export default function App() {
 
   async function clearFiles() {
     try {
+      const deletedIds = files.map((file) => file.id);
       const result = await api.clearFiles();
+      if (isUploadQueueSupported()) {
+        await Promise.allSettled(deletedIds.map((id) => clearQueuedUpload(id)));
+      }
+      setUploads((items) => items.filter((item) => !deletedIds.includes(item.id)));
       setConfirmClear(false);
       setConfirmDelete(null);
       setPreviewFile(null);
@@ -676,6 +845,10 @@ export default function App() {
   async function deleteFile(file) {
     try {
       await api.deleteFile(file.id);
+      if (isUploadQueueSupported()) {
+        await clearQueuedUpload(file.id).catch(() => {});
+      }
+      setUploads((items) => items.filter((item) => item.id !== file.id));
       setConfirmDelete(null);
       notify("Deleted", "ok");
       await refreshFiles();
@@ -816,7 +989,7 @@ export default function App() {
         <main className="work">
           <div className="work-head">
             <div className="shelf-count mono small">
-              <span>{stats.count} files</span>
+              <span>{stats.count} items</span>
               <span className="sep" />
               <span>{formatBytes(stats.totalBytes)}</span>
               <span className="sep" />
@@ -881,9 +1054,25 @@ export default function App() {
             onDragLeave={onDragLeave}
             title={uploadModeTitle}
           >
-            <UploadCloud className="dz-icon" size={34} strokeWidth={1.5} />
-            <span className="dz-title">Drop files</span>
+            {createFolderUpload ? (
+              <Folder className="dz-icon" size={34} strokeWidth={1.5} />
+            ) : (
+              <UploadCloud className="dz-icon" size={34} strokeWidth={1.5} />
+            )}
+            <span className="dz-title">{createFolderUpload ? "Drop files into a new folder" : "Drop files"}</span>
           </button>
+
+          <label className="bulk-toggle">
+            <input
+              type="checkbox"
+              checked={createFolderUpload}
+              onChange={(event) => setCreateFolderUpload(event.target.checked)}
+            />
+            <span>
+              <span className="bulk-title">Create Folder</span>
+              <span className="bulk-sub mono small muted">Group the next selection as a ZIP-downloadable folder.</span>
+            </span>
+          </label>
 
           <input ref={fileInputRef} type="file" multiple hidden onChange={onFilesPicked} />
 
@@ -936,6 +1125,7 @@ export default function App() {
                   onDelete={() => deleteFile(file)}
                   onDownload={() => downloadFile(file)}
                   onPreview={() => setPreviewFile(file)}
+                  onRename={() => renameFolder(file)}
                   onRequestDelete={() => setConfirmDelete(file.id)}
                   onCancelDelete={() => setConfirmDelete(null)}
                   onStartDrag={(event) => startExternalDrag(file, event)}
@@ -1217,7 +1407,7 @@ function UpdateInline({ update, onDownload, onInstall }) {
   return (
     <div className={`update-inline ${state === "error" ? "is-error" : ""}`} role="status">
       {state === "checking" && <span className="mono small muted">Checking for updates...</span>}
-      {state === "up-to-date" && <span className="mono small muted">You're on the latest version.</span>}
+      {state === "up-to-date" && <span className="mono small muted">{update.message || "You're on the latest version."}</span>}
       {state === "dev" && <span className="mono small muted">Updates run only in the installed app.</span>}
       {state === "error" && <span className="mono small danger">{update.message || "Update check failed."}</span>}
       {state === "available" && (
@@ -1284,14 +1474,16 @@ function FileCard({
   onDelete,
   onDownload,
   onPreview,
+  onRename,
   onRequestDelete,
   onStartDrag,
 }) {
   const Icon = iconFor(file);
+  const isFolder = isFolderEntry(file);
   const isImage = isImageFile(file);
   const isVideo = isVideoFile(file);
   const isPdf = isPdfFile(file);
-  const title = isDesktop ? "Click to preview. Drag to copy." : "Click to preview.";
+  const title = isFolder ? "Open folder." : isDesktop ? "Click to preview. Drag to copy." : "Click to preview.";
   function onCardKeyDown(event) {
     if (event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
@@ -1301,8 +1493,8 @@ function FileCard({
   return (
     <article
       aria-label={`Preview ${file.name}`}
-      className="file"
-      draggable={isDesktop}
+      className={`file ${isFolder ? "file-folder" : ""}`}
+      draggable={isDesktop && !isFolder}
       onClick={onPreview}
       onDragStart={isDesktop ? onStartDrag : undefined}
       onKeyDown={onCardKeyDown}
@@ -1310,7 +1502,12 @@ function FileCard({
       title={title}
     >
       <div className={`file-tile ${isImage || isVideo || isPdf ? "has-preview" : ""}`}>
-        {isImage ? (
+        {isFolder ? (
+          <>
+            <Folder size={34} strokeWidth={1.35} />
+            <span className="file-badge mono">ZIP</span>
+          </>
+        ) : isImage ? (
           <img className="file-preview-img" src={api.previewUrl(file.id)} alt="" loading="lazy" draggable={false} />
         ) : isVideo ? (
           <>
@@ -1356,7 +1553,8 @@ function FileCard({
           {file.name}
         </div>
         <div className="file-meta mono small">
-          <span>{formatBytes(file.size)}</span>
+          <span>{isFolder ? `${file.itemCount || 0} files` : formatBytes(file.size)}</span>
+          {isFolder && <span>{formatBytes(file.size)}</span>}
           <span>
             <Clock3 size={12} /> {timeLeft(file.expiresAt)}
           </span>
@@ -1364,17 +1562,31 @@ function FileCard({
             <Download size={12} /> {file.downloads || 0}
           </span>
         </div>
-        <button
-          className="file-sha mono small"
-          onClick={(event) => {
-            event.stopPropagation();
-            onCopyHash();
-          }}
-          onKeyDown={(event) => event.stopPropagation()}
-          title={file.sha256}
-        >
-          <Info size={12} /> {shortHash(file.sha256)}
-        </button>
+        {isFolder ? (
+          <button
+            className="file-sha mono small"
+            onClick={(event) => {
+              event.stopPropagation();
+              onRename?.();
+            }}
+            onKeyDown={(event) => event.stopPropagation()}
+            title="Rename folder"
+          >
+            <Pencil size={12} /> Rename
+          </button>
+        ) : (
+          <button
+            className="file-sha mono small"
+            onClick={(event) => {
+              event.stopPropagation();
+              onCopyHash();
+            }}
+            onKeyDown={(event) => event.stopPropagation()}
+            title={file.sha256}
+          >
+            <Info size={12} /> {shortHash(file.sha256)}
+          </button>
+        )}
       </div>
       <div
         className="file-actions"
@@ -1386,7 +1598,18 @@ function FileCard({
             <HardDriveDownload size={14} /> Save
           </button>
         ) : (
-          <a className="btn btn-solid btn-xs" href={api.downloadUrl(file.id)} download>
+          <a
+            className="btn btn-solid btn-xs"
+            href={api.downloadUrl(file.id)}
+            download
+            onClick={(event) => {
+              // Let the native download run for folders/small files; otherwise
+              // take over with the accelerated multi-connection download.
+              if (isFolder || !canParallelDownload(file)) return;
+              event.preventDefault();
+              onDownload();
+            }}
+          >
             <Download size={14} /> Get
           </a>
         )}
@@ -1411,7 +1634,7 @@ function FileCard({
 
 function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onDownload }) {
   const kind = previewKindFor(file);
-  const previewUrl = api.previewUrl(file.id);
+  const previewUrl = kind === "folder" ? "" : api.previewUrl(file.id);
   const [contextMenu, setContextMenu] = useState(null);
   const [closing, setClosing] = useState(false);
   const closeTimer = useRef(null);
@@ -1482,7 +1705,7 @@ function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onDownload }
             </div>
             <div className="preview-meta mono small">
               <span>{formatBytes(file.size)}</span>
-              <span>{file.mimeType || "application/octet-stream"}</span>
+              <span>{kind === "folder" ? `${file.itemCount || 0} files` : file.mimeType || "application/octet-stream"}</span>
               <span>{timeLeft(file.expiresAt)}</span>
             </div>
           </div>
@@ -1492,6 +1715,7 @@ function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onDownload }
         </header>
 
         <div className={`preview-body preview-${kind}`}>
+          {kind === "folder" && <FolderPreview file={file} />}
           {kind === "image" && (
             <img
               className="preview-media"
@@ -1530,9 +1754,11 @@ function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onDownload }
             {isDesktop ? <HardDriveDownload size={14} /> : <Download size={14} />}
             {isDesktop ? "Save" : "Get"}
           </button>
-          <a className="btn btn-ghost btn-sm" href={previewUrl} target="_blank" rel="noreferrer">
-            <ExternalLink size={14} /> Open
-          </a>
+          {kind !== "folder" && (
+            <a className="btn btn-ghost btn-sm" href={previewUrl} target="_blank" rel="noreferrer">
+              <ExternalLink size={14} /> Open
+            </a>
+          )}
         </footer>
       </section>
       {contextMenu && (
@@ -1588,6 +1814,34 @@ function TextPreview({ file, url }) {
   return <pre className="preview-text">{state.text || " "}</pre>;
 }
 
+function FolderPreview({ file }) {
+  const files = Array.isArray(file.files) ? file.files : [];
+  if (!files.length) {
+    return (
+      <div className="preview-empty">
+        <Folder size={42} strokeWidth={1.35} />
+        <span>This folder is empty.</span>
+      </div>
+    );
+  }
+  return (
+    <div className="folder-preview-list">
+      {files.map((child) => {
+        const Icon = iconFor(child);
+        return (
+          <div className="folder-preview-row" key={child.id}>
+            <Icon size={16} strokeWidth={1.5} />
+            <span className="folder-preview-name" title={child.name}>
+              {child.name}
+            </span>
+            <span className="mono small muted">{formatBytes(child.size)}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 async function request(url, options = {}) {
   const response = await fetch(url, {
     cache: "no-store",
@@ -1608,28 +1862,36 @@ async function request(url, options = {}) {
 async function uploadQueuedRecord({
   api,
   record,
+  transferBase = null,
   notifyUploadPaused,
   refreshFiles,
   registerBackgroundUpload,
   setUploads,
 }) {
-  const uploadUrl = record.uploadUrl || api.rawUploadUrl;
+  // Route through the direct HTTPS origin when it's reachable (real parallel
+  // HTTP/1.1 connections); otherwise use this page's origin.
+  const uploadUrl = transferBase
+    ? new URL("api/files/raw", transferBase).toString()
+    : record.uploadUrl || api.rawUploadUrl;
   const view = uploadRecordToView(record);
-  setUploads((items) => upsertUpload(items, { ...view, status: "uploading", progress: 0 }));
+  setUploads((items) => upsertUpload(items, { ...view, status: "uploading", progress: 1 }));
 
-  let lastPersistedProgress = 0;
+  let lastPersistedProgress = 1;
   const lockTimer = window.setInterval(() => {
     touchQueuedUploadLock(record.id).catch(() => {});
   }, Math.max(5000, Math.floor(PAGE_UPLOAD_LOCK_MS / 3)));
 
   try {
-    await new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
+    const result = await new Promise((resolve, reject) => {
       let settled = false;
       let lastActivityAt = Date.now();
+      let activeXhr = null;
+      let activeController = null;
+      let heartbeat = null;
 
       const cleanup = () => {
         window.clearInterval(stallTimer);
+        if (heartbeat) window.clearInterval(heartbeat);
         window.removeEventListener("offline", onOffline);
         window.removeEventListener("pagehide", onPageHide);
         document.removeEventListener("visibilitychange", onVisibilityChange);
@@ -1643,12 +1905,23 @@ async function uploadQueuedRecord({
       const fail = (message) => {
         if (settled) return;
         try {
-          xhr.abort();
+          activeXhr?.abort();
+        } catch {}
+        try {
+          activeController?.abort();
         } catch {}
         settle(reject, new Error(message));
       };
       const markActivity = () => {
         lastActivityAt = Date.now();
+      };
+      const applyProgress = (progress) => {
+        const visibleProgress = Math.max(1, Math.min(99, progress));
+        setUploads((items) => upsertUpload(items, { ...view, status: "uploading", progress: visibleProgress }));
+        if (progress - lastPersistedProgress >= 10 || progress === 100) {
+          lastPersistedProgress = visibleProgress;
+          updateQueuedUploadProgress(record.id, visibleProgress).catch(() => {});
+        }
       };
       const onOffline = () => fail("Upload paused while offline");
       const onPageHide = () => fail("Upload paused while app was backgrounded");
@@ -1665,35 +1938,65 @@ async function uploadQueuedRecord({
       window.addEventListener("pagehide", onPageHide);
       document.addEventListener("visibilitychange", onVisibilityChange);
 
-      xhr.open("POST", uploadUrl, true);
-      xhr.setRequestHeader("Content-Type", record.mimeType || "application/octet-stream");
-      xhr.setRequestHeader("X-WaterDrop-File-Name", encodeURIComponent(record.name || "unnamed-file"));
-      xhr.setRequestHeader("X-WaterDrop-Mime-Type", record.mimeType || "application/octet-stream");
-      xhr.setRequestHeader("X-WaterDrop-Upload-Id", record.id);
-      xhr.upload.onprogress = (event) => {
+      if (canParallelUpload(record)) {
+        // Large file: fan out into parallel byte-range chunks. Server reassembles
+        // and hashes them, so the stored bytes are identical to the source.
+        const controller = new AbortController();
+        activeController = controller;
         markActivity();
-        if (!event.lengthComputable) return;
-        const progress = Math.round((event.loaded / event.total) * 100);
-        setUploads((items) => upsertUpload(items, { ...view, status: "uploading", progress }));
-        if (progress - lastPersistedProgress >= 10 || progress === 100) {
-          lastPersistedProgress = progress;
-          updateQueuedUploadProgress(record.id, progress).catch(() => {});
-        }
-      };
-      xhr.upload.onload = markActivity;
-      xhr.onload = () => {
-        if (xhr.status >= 200 && xhr.status < 300) {
-          settle(resolve);
-          return;
-        }
-        settle(reject, new Error(`HTTP ${xhr.status}`));
-      };
-      xhr.onerror = () => settle(reject, new Error("Network error"));
-      xhr.onabort = () => settle(reject, new Error("Upload aborted"));
-      xhr.send(record.blob);
+        // XHR reports sub-chunk upload progress, but the final server-side hash
+        // can still spend time after all bytes are sent. Keep the connection
+        // considered "alive" while the final response is pending.
+        heartbeat = window.setInterval(markActivity, 15000);
+        parallelUpload({
+          blob: record.blob,
+          uploadUrl,
+          id: record.id,
+          name: record.name,
+          mimeType: record.mimeType,
+          folderId: record.folderId,
+          signal: controller.signal,
+          onProgress: applyProgress,
+          onActivity: markActivity,
+        })
+          .then((result) => settle(resolve, result))
+          .catch((err) => settle(reject, err instanceof Error ? err : new Error(String(err))));
+      } else {
+        // Small file: a single streamed request is already optimal.
+        const xhr = new XMLHttpRequest();
+        activeXhr = xhr;
+        xhr.open("POST", uploadUrl, true);
+        xhr.setRequestHeader("Content-Type", record.mimeType || "application/octet-stream");
+        xhr.setRequestHeader("X-WaterDrop-File-Name", encodeURIComponent(record.name || "unnamed-file"));
+        xhr.setRequestHeader("X-WaterDrop-Mime-Type", record.mimeType || "application/octet-stream");
+        xhr.setRequestHeader("X-WaterDrop-Upload-Id", record.id);
+        if (record.folderId) xhr.setRequestHeader("X-WaterDrop-Folder-Id", record.folderId);
+        xhr.upload.onprogress = (event) => {
+          markActivity();
+          if (!event.lengthComputable) return;
+          applyProgress(Math.round((event.loaded / event.total) * 100));
+        };
+        xhr.upload.onload = markActivity;
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            const data = parseJsonResponse(xhr.responseText);
+            settle(resolve, data);
+            return;
+          }
+          settle(reject, new Error(`HTTP ${xhr.status}`));
+        };
+        xhr.onerror = () => settle(reject, new Error("Network error"));
+        xhr.onabort = () => settle(reject, new Error("Upload aborted"));
+        xhr.send(record.blob);
+      }
     });
 
     await clearQueuedUpload(record.id);
+    if (result?.deleted) {
+      setUploads((items) => items.filter((item) => item.id !== record.id));
+      await refreshFiles({ silent: true });
+      return;
+    }
     setUploads((items) => upsertUpload(items, { ...view, queued: false, status: "done", progress: 100 }));
     window.setTimeout(() => {
       setUploads((items) => items.filter((item) => item.id !== record.id));
@@ -1706,6 +2009,15 @@ async function uploadQueuedRecord({
     notifyUploadPaused?.();
   } finally {
     window.clearInterval(lockTimer);
+  }
+}
+
+function parseJsonResponse(text) {
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return {};
   }
 }
 
@@ -1736,6 +2048,7 @@ function isWaterDropDrag(event) {
 }
 
 function iconFor(file) {
+  if (isFolderEntry(file)) return Folder;
   const type = String(file.mimeType || "");
   const name = String(file.name || "").toLowerCase();
   if (type.startsWith("image/")) return FileImage;
@@ -1749,25 +2062,34 @@ function iconFor(file) {
   return MoreHorizontal;
 }
 
+function isFolderEntry(file) {
+  return file?.kind === "folder";
+}
+
 function isImageFile(file) {
+  if (isFolderEntry(file)) return false;
   return String(file.mimeType || "").startsWith("image/");
 }
 
 function isVideoFile(file) {
+  if (isFolderEntry(file)) return false;
   return String(file.mimeType || "").startsWith("video/");
 }
 
 function isAudioFile(file) {
+  if (isFolderEntry(file)) return false;
   return String(file.mimeType || "").startsWith("audio/");
 }
 
 function isPdfFile(file) {
+  if (isFolderEntry(file)) return false;
   const type = String(file.mimeType || "").toLowerCase();
   const name = String(file.name || "").toLowerCase();
   return type === "application/pdf" || name.endsWith(".pdf");
 }
 
 function isTextFile(file) {
+  if (isFolderEntry(file)) return false;
   const type = String(file.mimeType || "").toLowerCase();
   const name = String(file.name || "").toLowerCase();
   return (
@@ -1778,6 +2100,7 @@ function isTextFile(file) {
 }
 
 function previewKindFor(file) {
+  if (isFolderEntry(file)) return "folder";
   if (isImageFile(file)) return "image";
   if (isVideoFile(file)) return "video";
   if (isAudioFile(file)) return "audio";
