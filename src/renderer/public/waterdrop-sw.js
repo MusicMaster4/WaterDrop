@@ -95,13 +95,13 @@ async function handleShareTarget(request) {
   const redirectUrl = new URL("./?shared=1", self.registration.scope);
   try {
     const queued = await queueShareTargetUploads(request);
+    redirectUrl.searchParams.set("shared", String(queued));
     if (queued > 0) {
       if (self.registration.sync?.register) {
         await self.registration.sync.register(SYNC_TAG).catch(() => {});
       }
-      await broadcast({ type: "WATERDROP_UPLOAD_QUEUED", count: queued, shared: true });
+      await broadcast({ type: "WATERDROP_UPLOAD_QUEUED", count: queued, shared: true }).catch(() => {});
     }
-    redirectUrl.searchParams.set("shared", String(queued));
   } catch (err) {
     console.error("Share target failed", err);
     redirectUrl.searchParams.set("shared", "error");
