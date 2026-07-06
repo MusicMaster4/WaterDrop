@@ -177,6 +177,14 @@ test("web share target uploads shared files and returns to the app", async () =>
 
   const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 48040 });
   try {
+    const nav = await fetch(new URL("share-target", server.localUrl), { redirect: "manual" });
+    assert.equal(nav.status, 302);
+    assert.equal(nav.headers.get("location"), "/drop/");
+
+    const head = await fetch(new URL("share-target", server.localUrl), { method: "HEAD", redirect: "manual" });
+    assert.equal(head.status, 302);
+    assert.equal(head.headers.get("location"), "/drop/");
+
     const form = new FormData();
     form.append("files", new Blob(["shared"], { type: "text/plain" }), "shared.txt");
 
@@ -192,6 +200,40 @@ test("web share target uploads shared files and returns to the app", async () =>
     assert.equal(listed.files.length, 1);
     assert.equal(listed.files[0].name, "shared.txt");
     assert.equal(listed.files[0].size, 6);
+  } finally {
+    await server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("web share target redirects back to the app when storage rejects an upload", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-share-target-error-test-"));
+  const rendererDir = path.join(root, "renderer");
+  const dataDir = path.join(root, "data");
+  const downloads = path.join(root, "downloads");
+  await fs.mkdir(rendererDir, { recursive: true });
+  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>WaterDrop</title>");
+
+  const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 48045 });
+  try {
+    server.store.addFromTemp = async () => {
+      throw new Error("disk full");
+    };
+
+    const form = new FormData();
+    form.append("files", new Blob(["shared"], { type: "text/plain" }), "shared.txt");
+
+    const upload = await fetch(new URL("share-target", server.localUrl), {
+      method: "POST",
+      body: form,
+      redirect: "manual",
+    });
+    assert.equal(upload.status, 303);
+    assert.equal(upload.headers.get("location"), "/drop/");
+
+    const listed = await (await fetch(new URL("api/files", server.localUrl))).json();
+    assert.equal(listed.files.length, 0);
+    assert.equal(listed.pending.length, 0);
   } finally {
     await server.close();
     await fs.rm(root, { recursive: true, force: true });

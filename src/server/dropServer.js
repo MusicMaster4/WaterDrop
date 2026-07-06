@@ -987,19 +987,33 @@ async function handleChunkUpload(req, res, store, { id, originalName, mimeType, 
 
 async function handleShareTarget({ req, res, store, redirectTo }) {
   if (req.method === "GET" || req.method === "HEAD") {
-    redirect(res, redirectTo);
+    redirect(res, redirectTo, 302);
     return;
   }
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "Method not allowed" });
     return;
   }
-  await handleUpload(req, res, store, { redirectTo });
+  try {
+    await handleUpload(req, res, store, { redirectTo });
+  } catch (err) {
+    if (err?.code === "UPLOAD_ABORTED") throw err;
+    console.error("Share target upload failed", err);
+    if (!res.headersSent) {
+      redirect(res, redirectTo, 303);
+      return;
+    }
+    throw err;
+  }
 }
 
 async function handleUpload(req, res, store, { redirectTo = "" } = {}) {
   const contentType = req.headers["content-type"] || "";
   if (!contentType.includes("multipart/form-data")) {
+    if (redirectTo) {
+      redirect(res, redirectTo, 303);
+      return;
+    }
     sendJson(res, 415, { error: "Expected multipart/form-data" });
     return;
   }
@@ -1090,6 +1104,10 @@ async function handleUpload(req, res, store, { redirectTo = "" } = {}) {
   } catch (err) {
     await Promise.allSettled(tempPaths.map((tempPath) => removeIfExists(tempPath)));
     pendingIds.forEach((id) => store.removePendingUpload(id, "upload-failed"));
+    if (redirectTo) {
+      redirect(res, redirectTo, 303);
+      return;
+    }
     sendJson(res, 500, { error: `Upload failed: ${err.message}` });
   }
 }
