@@ -3,6 +3,7 @@ const DB_VERSION = 1;
 const STORE_NAME = "uploads";
 const SYNC_TAG = "waterdrop-upload-queue";
 const WORKER_LOCK_MS = 2 * 60 * 1000;
+const SHARE_TARGET_PATH = "share-target";
 
 self.addEventListener("install", (event) => {
   event.waitUntil(self.skipWaiting());
@@ -19,6 +20,11 @@ self.addEventListener("sync", (event) => {
       if (result.failed > 0) throw new Error("Some uploads are still pending");
     })
   );
+});
+
+self.addEventListener("fetch", (event) => {
+  if (!isShareTargetRequest(event.request)) return;
+  event.respondWith(handleShareTarget(event.request));
 });
 
 self.addEventListener("backgroundfetchsuccess", (event) => {
@@ -83,6 +89,115 @@ async function uploadRecord(record) {
     },
   });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
+}
+
+async function handleShareTarget(request) {
+  const redirectUrl = new URL("./?shared=1", self.registration.scope);
+  try {
+    const queued = await queueShareTargetUploads(request);
+    if (queued > 0) {
+      if (self.registration.sync?.register) {
+        await self.registration.sync.register(SYNC_TAG).catch(() => {});
+      }
+      await broadcast({ type: "WATERDROP_UPLOAD_QUEUED", count: queued, shared: true });
+    }
+    redirectUrl.searchParams.set("shared", String(queued));
+  } catch (err) {
+    console.error("Share target failed", err);
+    redirectUrl.searchParams.set("shared", "error");
+  }
+  return Response.redirect(redirectUrl.href, 303);
+}
+
+async function queueShareTargetUploads(request) {
+  const formData = await request.formData();
+  const files = formData.getAll("files").filter(isFileLike);
+  if (!files.length) {
+    for (const value of formData.values()) {
+      if (isFileLike(value)) files.push(value);
+    }
+  }
+
+  if (!files.length) {
+    const sharedText = buildSharedTextFile(formData);
+    if (sharedText) files.push(sharedText);
+  }
+
+  let queued = 0;
+  for (const file of files) {
+    await queueSharedUpload(file);
+    queued += 1;
+  }
+  return queued;
+}
+
+async function queueSharedUpload(file) {
+  const now = Date.now();
+  const name = file.name || `shared-file-${now}`;
+  const record = {
+    id: crypto.randomUUID(),
+    name,
+    size: Number(file.size || 0),
+    mimeType: file.type || "application/octet-stream",
+    blob: file,
+    uploadUrl: new URL("api/files/raw", self.registration.scope).toString(),
+    status: "queued",
+    progress: 1,
+    attempts: 0,
+    createdAt: now,
+    updatedAt: now,
+    lockedUntil: 0,
+    lastError: "",
+    shared: true,
+  };
+  if (!await putUploadRecord(record)) throw new Error(`Could not queue ${name}`);
+  return record;
+}
+
+function buildSharedTextFile(formData) {
+  const title = cleanSharedText(formData.get("title"));
+  const text = cleanSharedText(formData.get("text"));
+  const url = cleanSharedText(formData.get("url"));
+  const lines = [];
+  if (title) lines.push(title);
+  if (url) lines.push(url);
+  if (text && text !== url) lines.push(text);
+  if (!lines.length) return null;
+
+  const body = `${lines.join("\n\n")}\n`;
+  const blob = new Blob([body], { type: "text/plain" });
+  const safeTitle = (title || "shared-link")
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+  const name = `${safeTitle || "shared-link"}.txt`;
+  try {
+    return new File([blob], name, { type: "text/plain" });
+  } catch {
+    blob.name = name;
+    return blob;
+  }
+}
+
+function cleanSharedText(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function isShareTargetRequest(request) {
+  if (request.method !== "POST") return false;
+  const requestPath = new URL(request.url).pathname.replace(/\/+$/, "");
+  const scopePath = new URL(self.registration.scope).pathname.replace(/\/+$/, "");
+  return requestPath === `${scopePath}/${SHARE_TARGET_PATH}`;
+}
+
+function isFileLike(value) {
+  return (
+    value &&
+    typeof value === "object" &&
+    typeof value.arrayBuffer === "function" &&
+    typeof value.size === "number"
+  );
 }
 
 async function broadcast(message) {

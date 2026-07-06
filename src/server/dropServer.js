@@ -687,6 +687,11 @@ async function handleRequest({ req, res, store, rendererDir, getPort, getHttpsPo
     return;
   }
 
+  if (pathname === "/share-target") {
+    await handleShareTarget({ req, res, store, redirectTo: "/" });
+    return;
+  }
+
   if (pathname.startsWith("/api/")) {
     await handleApi({ req, res, url, relative: pathname, store, getPort, getHttpsPort, eventClients });
     return;
@@ -694,6 +699,10 @@ async function handleRequest({ req, res, store, rendererDir, getPort, getHttpsPo
 
   if (pathname.startsWith(`${BASE_PATH}/`)) {
     const relative = pathname.slice(BASE_PATH.length);
+    if (relative === "/share-target") {
+      await handleShareTarget({ req, res, store, redirectTo: `${BASE_PATH}/` });
+      return;
+    }
     if (relative.startsWith("/api/")) {
       await handleApi({ req, res, url, relative, store, getPort, getHttpsPort, eventClients });
       return;
@@ -702,7 +711,14 @@ async function handleRequest({ req, res, store, rendererDir, getPort, getHttpsPo
     return;
   }
 
-  if (pathname === "/" || pathname === "/index.html" || pathname === "/icon.ico" || pathname.startsWith("/assets/")) {
+  if (
+    pathname === "/" ||
+    pathname === "/index.html" ||
+    pathname === "/icon.ico" ||
+    pathname === "/manifest.webmanifest" ||
+    pathname === "/waterdrop-sw.js" ||
+    pathname.startsWith("/assets/")
+  ) {
     await serveStatic({ req, res, pathname, rendererDir });
     return;
   }
@@ -969,7 +985,19 @@ async function handleChunkUpload(req, res, store, { id, originalName, mimeType, 
   }
 }
 
-async function handleUpload(req, res, store) {
+async function handleShareTarget({ req, res, store, redirectTo }) {
+  if (req.method === "GET" || req.method === "HEAD") {
+    redirect(res, redirectTo);
+    return;
+  }
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+  await handleUpload(req, res, store, { redirectTo });
+}
+
+async function handleUpload(req, res, store, { redirectTo = "" } = {}) {
   const contentType = req.headers["content-type"] || "";
   if (!contentType.includes("multipart/form-data")) {
     sendJson(res, 415, { error: "Expected multipart/form-data" });
@@ -1054,6 +1082,10 @@ async function handleUpload(req, res, store) {
 
   try {
     const files = await Promise.all(uploadPromises);
+    if (redirectTo) {
+      redirect(res, redirectTo, 303);
+      return;
+    }
     sendJson(res, 201, { files });
   } catch (err) {
     await Promise.allSettled(tempPaths.map((tempPath) => removeIfExists(tempPath)));
@@ -1599,8 +1631,8 @@ function corsHeaders() {
   };
 }
 
-function redirect(res, location) {
-  res.writeHead(308, { Location: location });
+function redirect(res, location, status = 308) {
+  res.writeHead(status, { Location: location });
   res.end();
 }
 

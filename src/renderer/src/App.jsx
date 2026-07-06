@@ -326,14 +326,18 @@ export default function App() {
     const onMessage = (event) => {
       const type = event.data?.type || "";
       if (!type.startsWith("WATERDROP_UPLOAD_")) return;
-      refreshFiles({ silent: true }).then(refreshQueuedUploads);
+      refreshFiles({ silent: true })
+        .then(refreshQueuedUploads)
+        .then(() => {
+          if (type === "WATERDROP_UPLOAD_QUEUED") drainQueuedUploads();
+        });
     };
     navigator.serviceWorker.addEventListener("message", onMessage);
     return () => {
       active = false;
       navigator.serviceWorker.removeEventListener("message", onMessage);
     };
-  }, [refreshFiles, refreshQueuedUploads, registerBackgroundUpload]);
+  }, [drainQueuedUploads, refreshFiles, refreshQueuedUploads, registerBackgroundUpload]);
 
   useEffect(() => {
     let mounted = true;

@@ -167,6 +167,37 @@ test("uploads announce a placeholder before committing", async () => {
   }
 });
 
+test("web share target uploads shared files and returns to the app", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-share-target-test-"));
+  const rendererDir = path.join(root, "renderer");
+  const dataDir = path.join(root, "data");
+  const downloads = path.join(root, "downloads");
+  await fs.mkdir(rendererDir, { recursive: true });
+  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>WaterDrop</title>");
+
+  const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 48040 });
+  try {
+    const form = new FormData();
+    form.append("files", new Blob(["shared"], { type: "text/plain" }), "shared.txt");
+
+    const upload = await fetch(new URL("share-target", server.localUrl), {
+      method: "POST",
+      body: form,
+      redirect: "manual",
+    });
+    assert.equal(upload.status, 303);
+    assert.equal(upload.headers.get("location"), "/drop/");
+
+    const listed = await (await fetch(new URL("api/files", server.localUrl))).json();
+    assert.equal(listed.files.length, 1);
+    assert.equal(listed.files[0].name, "shared.txt");
+    assert.equal(listed.files[0].size, 6);
+  } finally {
+    await server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("pending upload placeholder clears once the file lands", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-pending-test-"));
   const rendererDir = path.join(root, "renderer");
