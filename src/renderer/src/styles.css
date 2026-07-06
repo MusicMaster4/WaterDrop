@@ -569,17 +569,51 @@ body::before {
   background: var(--panel);
   padding: 12px;
 }
-.text-compose-head,
+.text-compose.is-collapsed {
+  padding: 0;
+  overflow: hidden;
+}
+.text-compose-head {
+  width: 100%;
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+  text-align: left;
+}
+.text-compose.is-collapsed .text-compose-head {
+  padding: 11px 12px;
+}
+.text-compose-head:hover .text-compose-summary,
+.text-compose-head:hover svg {
+  color: var(--ink);
+}
+.text-compose-label,
 .text-compose-actions {
   display: flex;
   align-items: center;
   gap: 8px;
 }
-.text-compose-head svg {
-  color: var(--silver);
+.text-compose-label {
+  flex: none;
 }
-.text-compose-head span:last-child {
+.text-compose-head svg,
+.text-compose-label svg {
+  color: var(--silver);
+  flex: none;
+}
+.text-compose-summary {
   margin-left: auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .text-compose-input {
   width: 100%;

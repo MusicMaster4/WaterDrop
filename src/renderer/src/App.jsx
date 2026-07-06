@@ -126,6 +126,7 @@ export default function App() {
   const [settings, setSettings] = useState({});
   const [uploads, setUploads] = useState([]);
   const [textDraft, setTextDraft] = useState("");
+  const [textComposerOpen, setTextComposerOpen] = useState(false);
   const [createFolderUpload, setCreateFolderUpload] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(true);
@@ -218,6 +219,7 @@ export default function App() {
   }, [notify]);
 
   const startBackgroundFetchUpload = useCallback(async (record) => {
+    if (isDesktop) return false;
     const registration = serviceWorkerRegistrationRef.current;
     if (!registration?.backgroundFetch?.fetch) return false;
     try {
@@ -244,7 +246,7 @@ export default function App() {
       await markQueuedUploadFailed(record.id, "Background fetch unavailable").catch(() => {});
       return false;
     }
-  }, []);
+  }, [isDesktop]);
 
   const drainQueuedUploads = useCallback(async () => {
     if (drainingUploadsRef.current || !api.rawUploadUrl || !isUploadQueueSupported()) return;
@@ -258,9 +260,11 @@ export default function App() {
       const runNext = async () => {
         while (queue.length) {
           const record = queue.shift();
-          const activeBackgroundFetch = await serviceWorkerRegistrationRef.current?.backgroundFetch
-            ?.get(record.id)
-            .catch(() => null);
+          const activeBackgroundFetch = isDesktop
+            ? null
+            : await serviceWorkerRegistrationRef.current?.backgroundFetch
+              ?.get(record.id)
+              .catch(() => null);
           if (activeBackgroundFetch) continue;
           const forceClaim = record.status === "syncing";
           if (forceClaim) {
@@ -288,7 +292,7 @@ export default function App() {
       drainingUploadsRef.current = false;
       await refreshQueuedUploads();
     }
-  }, [api, notifyUploadPaused, refreshFiles, refreshQueuedUploads, registerBackgroundUpload]);
+  }, [api, isDesktop, notifyUploadPaused, refreshFiles, refreshQueuedUploads, registerBackgroundUpload]);
 
   useEffect(() => {
     if (!("serviceWorker" in navigator) || !window.isSecureContext) {
@@ -504,7 +508,9 @@ export default function App() {
       nextExpiry: files.reduce((min, file) => Math.min(min, file.expiresAt || Infinity), Infinity),
     };
   }, [files]);
-  const uploadModeTitle = uploadSupport.backgroundFetch
+  const uploadModeTitle = isDesktop
+    ? "Uploads run while WaterDrop is open."
+    : uploadSupport.backgroundFetch
     ? "Background uploads can continue through the browser task UI."
     : uploadSupport.backgroundSync
     ? "Queued uploads can retry in the background on this browser."
@@ -679,6 +685,7 @@ export default function App() {
     if (!textDraft.trim()) return;
     const file = createTextUploadFile(textDraft);
     setTextDraft("");
+    setTextComposerOpen(false);
     await uploadFiles([file], { groupSelection: false });
   }
 
@@ -1091,34 +1098,52 @@ export default function App() {
             <span className="dz-title">{createFolderUpload ? "Drop files into a new folder" : "Drop files"}</span>
           </button>
 
-          <form className="text-compose" onSubmit={sendTextDraft}>
-            <div className="text-compose-head">
-              <FileText size={16} />
-              <span className="mono small muted">Text</span>
-              <span className="mono small faint">{formatBytes(new Blob([textDraft]).size)}</span>
-            </div>
-            <textarea
-              className="text-compose-input"
-              value={textDraft}
-              onChange={(event) => setTextDraft(event.target.value)}
-              aria-label="Text to send"
-              placeholder="Paste text..."
-              rows={4}
-              spellCheck={true}
-            />
-            <div className="text-compose-actions">
-              <button
-                className="btn btn-ghost btn-xs"
-                type="button"
-                onClick={clearTextDraft}
-                disabled={!textDraft}
-              >
-                <X size={13} /> Clear
-              </button>
-              <button className="btn btn-solid btn-xs" type="submit" disabled={!textDraft.trim()}>
-                <Send size={13} /> Send Text
-              </button>
-            </div>
+          <form
+            className={`text-compose ${textComposerOpen ? "is-open" : "is-collapsed"}`}
+            onSubmit={sendTextDraft}
+          >
+            <button
+              className="text-compose-head"
+              type="button"
+              onClick={() => setTextComposerOpen((open) => !open)}
+              aria-expanded={textComposerOpen}
+            >
+              <span className="text-compose-label">
+                <FileText size={16} />
+                <span className="mono small muted">Text</span>
+              </span>
+              <span className="text-compose-summary mono small faint">
+                {textDraft ? formatBytes(new Blob([textDraft]).size) : "Paste or type text"}
+              </span>
+              {textComposerOpen ? <ChevronDown size={16} /> : <Send size={16} />}
+            </button>
+            {textComposerOpen && (
+              <>
+                <textarea
+                  className="text-compose-input"
+                  value={textDraft}
+                  onChange={(event) => setTextDraft(event.target.value)}
+                  aria-label="Text to send"
+                  placeholder="Paste text..."
+                  rows={4}
+                  spellCheck={true}
+                  autoFocus
+                />
+                <div className="text-compose-actions">
+                  <button
+                    className="btn btn-ghost btn-xs"
+                    type="button"
+                    onClick={clearTextDraft}
+                    disabled={!textDraft}
+                  >
+                    <X size={13} /> Clear
+                  </button>
+                  <button className="btn btn-solid btn-xs" type="submit" disabled={!textDraft.trim()}>
+                    <Send size={13} /> Send Text
+                  </button>
+                </div>
+              </>
+            )}
           </form>
 
           <label className="bulk-toggle">
