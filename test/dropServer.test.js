@@ -240,6 +240,42 @@ test("web share target redirects back to the app when storage rejects an upload"
   }
 });
 
+test("web share target preserves text-only shares in the server fallback", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-share-target-text-test-"));
+  const rendererDir = path.join(root, "renderer");
+  const dataDir = path.join(root, "data");
+  const downloads = path.join(root, "downloads");
+  await fs.mkdir(rendererDir, { recursive: true });
+  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>WaterDrop</title>");
+
+  const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 48046 });
+  try {
+    const form = new FormData();
+    form.append("title", "Example: Link");
+    form.append("url", "https://example.com/page");
+    form.append("text", "A useful reference");
+
+    const upload = await fetch(new URL("share-target", server.localUrl), {
+      method: "POST",
+      body: form,
+      redirect: "manual",
+    });
+    assert.equal(upload.status, 303);
+    assert.equal(upload.headers.get("location"), "/drop/");
+
+    const listed = await (await fetch(new URL("api/files", server.localUrl))).json();
+    assert.equal(listed.files.length, 1);
+    assert.equal(listed.files[0].name, "Example_ Link.txt");
+    assert.equal(listed.files[0].mimeType, "text/plain");
+
+    const download = await fetch(new URL(`api/files/${listed.files[0].id}/download`, server.localUrl));
+    assert.equal(await download.text(), "Example: Link\n\nhttps://example.com/page\n\nA useful reference\n");
+  } finally {
+    await server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("pending upload placeholder clears once the file lands", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-pending-test-"));
   const rendererDir = path.join(root, "renderer");

@@ -1027,6 +1027,7 @@ async function handleUpload(req, res, store, { redirectTo = "" } = {}) {
   const uploadPromises = [];
   const tempPaths = [];
   const pendingIds = [];
+  const fields = new Map();
 
   busboy.on("file", (_fieldName, fileStream, info) => {
     const originalName = info.filename || "unnamed-file";
@@ -1066,6 +1067,10 @@ async function handleUpload(req, res, store, { redirectTo = "" } = {}) {
     uploadPromises.push(promise);
   });
 
+  busboy.on("field", (name, value) => {
+    if (!fields.has(name)) fields.set(name, value);
+  });
+
   let aborted = false;
   busboy.on("error", (err) => {
     if (!aborted) console.error("Upload parser failed", err);
@@ -1094,6 +1099,29 @@ async function handleUpload(req, res, store, { redirectTo = "" } = {}) {
     throw err;
   }
 
+  if (redirectTo && uploadPromises.length === 0) {
+    const sharedText = buildSharedTextUpload(fields);
+    if (sharedText) {
+      const id = crypto.randomUUID();
+      const tempPath = path.join(store.tmpDir, `${id}.upload`);
+      tempPaths.push(tempPath);
+      pendingIds.push(id);
+      store.addPendingUpload({ id, name: sharedText.name, size: sharedText.body.length });
+      uploadPromises.push(
+        fsp.writeFile(tempPath, sharedText.body).then(() =>
+          store.addFromTemp({
+            id,
+            tempPath,
+            originalName: sharedText.name,
+            mimeType: "text/plain",
+            size: sharedText.body.length,
+            sha256: crypto.createHash("sha256").update(sharedText.body).digest("hex"),
+          })
+        )
+      );
+    }
+  }
+
   try {
     const files = await Promise.all(uploadPromises);
     if (redirectTo) {
@@ -1110,6 +1138,32 @@ async function handleUpload(req, res, store, { redirectTo = "" } = {}) {
     }
     sendJson(res, 500, { error: `Upload failed: ${err.message}` });
   }
+}
+
+function buildSharedTextUpload(fields) {
+  const title = cleanSharedText(fields.get("title"));
+  const text = cleanSharedText(fields.get("text"));
+  const url = cleanSharedText(fields.get("url"));
+  const lines = [];
+  if (title) lines.push(title);
+  if (url) lines.push(url);
+  if (text && text !== url) lines.push(text);
+  if (!lines.length) return null;
+
+  const body = Buffer.from(`${lines.join("\n\n")}\n`, "utf8");
+  const safeTitle = (title || "shared-link")
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+  return {
+    body,
+    name: `${safeTitle || "shared-link"}.txt`,
+  };
+}
+
+function cleanSharedText(value) {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 async function handleDownload(req, res, store, id) {
