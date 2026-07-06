@@ -76,6 +76,7 @@ class FileStore extends EventEmitter {
     await fsp.mkdir(this.filesDir, { recursive: true });
     await fsp.mkdir(this.tmpDir, { recursive: true });
     await fsp.mkdir(this.dragDir, { recursive: true });
+    await this.cleanupTemporaryUploads();
     await this.load();
     await this.cleanupExpired();
   }
@@ -322,6 +323,36 @@ class FileStore extends EventEmitter {
     }
     if (changed) this.notifyFilesChanged(reason);
     return changed;
+  }
+
+  async cancelUpload(id) {
+    if (!isValidFileId(id)) return { ok: false, cancelled: false, reason: "invalid-id" };
+    if (this.get(id)) return { ok: true, cancelled: false, completed: true };
+    await this.rememberDeletedUploads([id]);
+    const changed = await this.cancelInFlightUploads([id], "upload-cancelled");
+    await this.removeUploadTempFiles(id);
+    if (!changed) this.notifyFilesChanged("upload-cancelled");
+    return { ok: true, cancelled: true };
+  }
+
+  async cleanupTemporaryUploads() {
+    await removeDirIfExists(this.tmpDir);
+    await fsp.mkdir(this.tmpDir, { recursive: true });
+  }
+
+  async removeUploadTempFiles(id) {
+    if (!isValidFileId(id)) return;
+    let entries;
+    try {
+      entries = await fsp.readdir(this.tmpDir);
+    } catch {
+      return;
+    }
+    const prefix = `${id}.`;
+    const names = entries.filter(
+      (name) => name === `${id}.chunked.upload` || (name.startsWith(prefix) && name.endsWith(".upload"))
+    );
+    await Promise.allSettled(names.map((name) => removeIfExists(path.join(this.tmpDir, name))));
   }
 
   // --- Chunked (parallel) upload assembly ---------------------------------
@@ -687,6 +718,11 @@ async function handleRequest({ req, res, store, rendererDir, getPort, getHttpsPo
     return;
   }
 
+  if (pathname === "/share-target") {
+    await handleShareTarget({ req, res, store, redirectTo: "/" });
+    return;
+  }
+
   if (pathname.startsWith("/api/")) {
     await handleApi({ req, res, url, relative: pathname, store, getPort, getHttpsPort, eventClients });
     return;
@@ -694,6 +730,10 @@ async function handleRequest({ req, res, store, rendererDir, getPort, getHttpsPo
 
   if (pathname.startsWith(`${BASE_PATH}/`)) {
     const relative = pathname.slice(BASE_PATH.length);
+    if (relative === "/share-target") {
+      await handleShareTarget({ req, res, store, redirectTo: `${BASE_PATH}/` });
+      return;
+    }
     if (relative.startsWith("/api/")) {
       await handleApi({ req, res, url, relative, store, getPort, getHttpsPort, eventClients });
       return;
@@ -702,7 +742,14 @@ async function handleRequest({ req, res, store, rendererDir, getPort, getHttpsPo
     return;
   }
 
-  if (pathname === "/" || pathname === "/index.html" || pathname === "/icon.ico" || pathname.startsWith("/assets/")) {
+  if (
+    pathname === "/" ||
+    pathname === "/index.html" ||
+    pathname === "/icon.ico" ||
+    pathname === "/manifest.webmanifest" ||
+    pathname === "/waterdrop-sw.js" ||
+    pathname.startsWith("/assets/")
+  ) {
     await serveStatic({ req, res, pathname, rendererDir });
     return;
   }
@@ -782,6 +829,15 @@ async function handleApi({ req, res, relative, store, getPort, getHttpsPort, eve
     const deleted = await store.clear();
     sendJson(res, 200, { ok: true, deleted });
     return;
+  }
+
+  const uploadMatch = relative.match(/^\/api\/uploads\/([a-f0-9-]+)$/);
+  if (uploadMatch) {
+    if (req.method === "DELETE") {
+      const result = await store.cancelUpload(uploadMatch[1]);
+      sendJson(res, result.ok ? 200 : 400, result.ok ? result : { error: "Invalid upload id" });
+      return;
+    }
   }
 
   const folderMatch = relative.match(/^\/api\/folders\/([a-f0-9-]+)$/);
@@ -969,9 +1025,35 @@ async function handleChunkUpload(req, res, store, { id, originalName, mimeType, 
   }
 }
 
-async function handleUpload(req, res, store) {
+async function handleShareTarget({ req, res, store, redirectTo }) {
+  if (req.method === "GET" || req.method === "HEAD") {
+    redirect(res, redirectTo, 302);
+    return;
+  }
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+  try {
+    await handleUpload(req, res, store, { redirectTo });
+  } catch (err) {
+    if (err?.code === "UPLOAD_ABORTED") throw err;
+    console.error("Share target upload failed", err);
+    if (!res.headersSent) {
+      redirect(res, redirectTo, 303);
+      return;
+    }
+    throw err;
+  }
+}
+
+async function handleUpload(req, res, store, { redirectTo = "" } = {}) {
   const contentType = req.headers["content-type"] || "";
   if (!contentType.includes("multipart/form-data")) {
+    if (redirectTo) {
+      redirect(res, redirectTo, 303);
+      return;
+    }
     sendJson(res, 415, { error: "Expected multipart/form-data" });
     return;
   }
@@ -985,6 +1067,7 @@ async function handleUpload(req, res, store) {
   const uploadPromises = [];
   const tempPaths = [];
   const pendingIds = [];
+  const fields = new Map();
 
   busboy.on("file", (_fieldName, fileStream, info) => {
     const originalName = info.filename || "unnamed-file";
@@ -1024,6 +1107,10 @@ async function handleUpload(req, res, store) {
     uploadPromises.push(promise);
   });
 
+  busboy.on("field", (name, value) => {
+    if (!fields.has(name)) fields.set(name, value);
+  });
+
   let aborted = false;
   busboy.on("error", (err) => {
     if (!aborted) console.error("Upload parser failed", err);
@@ -1052,14 +1139,71 @@ async function handleUpload(req, res, store) {
     throw err;
   }
 
+  if (redirectTo && uploadPromises.length === 0) {
+    const sharedText = buildSharedTextUpload(fields);
+    if (sharedText) {
+      const id = crypto.randomUUID();
+      const tempPath = path.join(store.tmpDir, `${id}.upload`);
+      tempPaths.push(tempPath);
+      pendingIds.push(id);
+      store.addPendingUpload({ id, name: sharedText.name, size: sharedText.body.length });
+      uploadPromises.push(
+        fsp.writeFile(tempPath, sharedText.body).then(() =>
+          store.addFromTemp({
+            id,
+            tempPath,
+            originalName: sharedText.name,
+            mimeType: "text/plain",
+            size: sharedText.body.length,
+            sha256: crypto.createHash("sha256").update(sharedText.body).digest("hex"),
+          })
+        )
+      );
+    }
+  }
+
   try {
     const files = await Promise.all(uploadPromises);
+    if (redirectTo) {
+      redirect(res, redirectTo, 303);
+      return;
+    }
     sendJson(res, 201, { files });
   } catch (err) {
     await Promise.allSettled(tempPaths.map((tempPath) => removeIfExists(tempPath)));
     pendingIds.forEach((id) => store.removePendingUpload(id, "upload-failed"));
+    if (redirectTo) {
+      redirect(res, redirectTo, 303);
+      return;
+    }
     sendJson(res, 500, { error: `Upload failed: ${err.message}` });
   }
+}
+
+function buildSharedTextUpload(fields) {
+  const title = cleanSharedText(fields.get("title"));
+  const text = cleanSharedText(fields.get("text"));
+  const url = cleanSharedText(fields.get("url"));
+  const lines = [];
+  if (title) lines.push(title);
+  if (url) lines.push(url);
+  if (text && text !== url) lines.push(text);
+  if (!lines.length) return null;
+
+  const body = Buffer.from(`${lines.join("\n\n")}\n`, "utf8");
+  const safeTitle = (title || "shared-link")
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+  return {
+    body,
+    name: `${safeTitle || "shared-link"}.txt`,
+  };
+}
+
+function cleanSharedText(value) {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 async function handleDownload(req, res, store, id) {
@@ -1599,8 +1743,8 @@ function corsHeaders() {
   };
 }
 
-function redirect(res, location) {
-  res.writeHead(308, { Location: location });
+function redirect(res, location, status = 308) {
+  res.writeHead(status, { Location: location });
   res.end();
 }
 

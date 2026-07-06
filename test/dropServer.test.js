@@ -167,6 +167,115 @@ test("uploads announce a placeholder before committing", async () => {
   }
 });
 
+test("web share target uploads shared files and returns to the app", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-share-target-test-"));
+  const rendererDir = path.join(root, "renderer");
+  const dataDir = path.join(root, "data");
+  const downloads = path.join(root, "downloads");
+  await fs.mkdir(rendererDir, { recursive: true });
+  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>WaterDrop</title>");
+
+  const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 48040 });
+  try {
+    const nav = await fetch(new URL("share-target", server.localUrl), { redirect: "manual" });
+    assert.equal(nav.status, 302);
+    assert.equal(nav.headers.get("location"), "/drop/");
+
+    const head = await fetch(new URL("share-target", server.localUrl), { method: "HEAD", redirect: "manual" });
+    assert.equal(head.status, 302);
+    assert.equal(head.headers.get("location"), "/drop/");
+
+    const form = new FormData();
+    form.append("files", new Blob(["shared"], { type: "text/plain" }), "shared.txt");
+
+    const upload = await fetch(new URL("share-target", server.localUrl), {
+      method: "POST",
+      body: form,
+      redirect: "manual",
+    });
+    assert.equal(upload.status, 303);
+    assert.equal(upload.headers.get("location"), "/drop/");
+
+    const listed = await (await fetch(new URL("api/files", server.localUrl))).json();
+    assert.equal(listed.files.length, 1);
+    assert.equal(listed.files[0].name, "shared.txt");
+    assert.equal(listed.files[0].size, 6);
+  } finally {
+    await server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("web share target redirects back to the app when storage rejects an upload", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-share-target-error-test-"));
+  const rendererDir = path.join(root, "renderer");
+  const dataDir = path.join(root, "data");
+  const downloads = path.join(root, "downloads");
+  await fs.mkdir(rendererDir, { recursive: true });
+  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>WaterDrop</title>");
+
+  const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 48045 });
+  try {
+    server.store.addFromTemp = async () => {
+      throw new Error("disk full");
+    };
+
+    const form = new FormData();
+    form.append("files", new Blob(["shared"], { type: "text/plain" }), "shared.txt");
+
+    const upload = await fetch(new URL("share-target", server.localUrl), {
+      method: "POST",
+      body: form,
+      redirect: "manual",
+    });
+    assert.equal(upload.status, 303);
+    assert.equal(upload.headers.get("location"), "/drop/");
+
+    const listed = await (await fetch(new URL("api/files", server.localUrl))).json();
+    assert.equal(listed.files.length, 0);
+    assert.equal(listed.pending.length, 0);
+  } finally {
+    await server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("web share target preserves text-only shares in the server fallback", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-share-target-text-test-"));
+  const rendererDir = path.join(root, "renderer");
+  const dataDir = path.join(root, "data");
+  const downloads = path.join(root, "downloads");
+  await fs.mkdir(rendererDir, { recursive: true });
+  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>WaterDrop</title>");
+
+  const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 48046 });
+  try {
+    const form = new FormData();
+    form.append("title", "Example: Link");
+    form.append("url", "https://example.com/page");
+    form.append("text", "A useful reference");
+
+    const upload = await fetch(new URL("share-target", server.localUrl), {
+      method: "POST",
+      body: form,
+      redirect: "manual",
+    });
+    assert.equal(upload.status, 303);
+    assert.equal(upload.headers.get("location"), "/drop/");
+
+    const listed = await (await fetch(new URL("api/files", server.localUrl))).json();
+    assert.equal(listed.files.length, 1);
+    assert.equal(listed.files[0].name, "Example_ Link.txt");
+    assert.equal(listed.files[0].mimeType, "text/plain");
+
+    const download = await fetch(new URL(`api/files/${listed.files[0].id}/download`, server.localUrl));
+    assert.equal(await download.text(), "Example: Link\n\nhttps://example.com/page\n\nA useful reference\n");
+  } finally {
+    await server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("pending upload placeholder clears once the file lands", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-pending-test-"));
   const rendererDir = path.join(root, "renderer");
@@ -203,6 +312,72 @@ test("pending upload placeholder clears once the file lands", async () => {
     assert.equal(after.pending.length, 0);
     assert.equal(after.files.length, 1);
     assert.equal(after.files[0].id, id);
+  } finally {
+    await server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cancelled in-flight uploads clear placeholders and reject stale retries", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-cancel-upload-test-"));
+  const rendererDir = path.join(root, "renderer");
+  const dataDir = path.join(root, "data");
+  const downloads = path.join(root, "downloads");
+  await fs.mkdir(rendererDir, { recursive: true });
+  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>WaterDrop</title>");
+
+  const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 48010 });
+  try {
+    const id = "44444444-4444-4444-8444-444444444444";
+    server.store.addPendingUpload({ id, name: "stuck.txt", size: 2 });
+
+    const before = await (await fetch(new URL("api/files", server.localUrl))).json();
+    assert.equal(before.pending.length, 1);
+
+    const cancelled = await fetch(new URL(`api/uploads/${id}`, server.localUrl), { method: "DELETE" });
+    assert.equal(cancelled.status, 200);
+    const cancelledBody = await cancelled.json();
+    assert.equal(cancelledBody.cancelled, true);
+
+    const afterCancel = await (await fetch(new URL("api/files", server.localUrl))).json();
+    assert.equal(afterCancel.pending.length, 0);
+    assert.equal(afterCancel.deletedUploads.includes(id), true);
+
+    const staleRetry = await fetch(new URL("api/files/raw", server.localUrl), {
+      method: "POST",
+      body: new Blob(["stale"], { type: "text/plain" }),
+      headers: {
+        "Content-Type": "text/plain",
+        "X-WaterDrop-File-Name": encodeURIComponent("stuck.txt"),
+        "X-WaterDrop-Mime-Type": "text/plain",
+        "X-WaterDrop-Upload-Id": id,
+      },
+    });
+    assert.equal(staleRetry.status, 200);
+    const staleRetryBody = await staleRetry.json();
+    assert.equal(staleRetryBody.deleted, true);
+    assert.equal(staleRetryBody.files.length, 0);
+  } finally {
+    await server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("startup removes stale upload temp files from previous instances", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-temp-cleanup-test-"));
+  const rendererDir = path.join(root, "renderer");
+  const dataDir = path.join(root, "data");
+  const downloads = path.join(root, "downloads");
+  const tmpDir = path.join(dataDir, "tmp");
+  await fs.mkdir(rendererDir, { recursive: true });
+  await fs.mkdir(tmpDir, { recursive: true });
+  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>WaterDrop</title>");
+  await fs.writeFile(path.join(tmpDir, "stale.upload"), "partial");
+
+  const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 48011 });
+  try {
+    const entries = await fs.readdir(tmpDir);
+    assert.deepEqual(entries, []);
   } finally {
     await server.close();
     await fs.rm(root, { recursive: true, force: true });

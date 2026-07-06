@@ -560,6 +560,87 @@ body::before {
   font-size: 1rem;
 }
 
+.text-compose {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  padding: 12px;
+}
+.text-compose.is-collapsed {
+  padding: 0;
+  overflow: hidden;
+}
+.text-compose-head {
+  width: 100%;
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+  text-align: left;
+}
+.text-compose.is-collapsed .text-compose-head {
+  padding: 11px 12px;
+}
+.text-compose-head:hover .text-compose-summary,
+.text-compose-head:hover svg {
+  color: var(--ink);
+}
+.text-compose-label,
+.text-compose-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.text-compose-label {
+  flex: none;
+}
+.text-compose-head svg,
+.text-compose-label svg {
+  color: var(--silver);
+  flex: none;
+}
+.text-compose-summary {
+  margin-left: auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.text-compose-input {
+  width: 100%;
+  min-height: 104px;
+  max-height: 260px;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-solid);
+  color: var(--text);
+  font: 0.88rem/1.5 var(--mono);
+  padding: 10px 11px;
+  outline: none;
+  overflow-wrap: anywhere;
+}
+.text-compose-input:focus {
+  border-color: var(--line-strong);
+  box-shadow: 0 0 0 3px rgba(247, 248, 250, 0.04);
+}
+.text-compose-input::placeholder {
+  color: var(--faint);
+}
+.text-compose-actions {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
 .bulk-toggle {
   display: flex;
   align-items: center;
@@ -685,6 +766,10 @@ body::before {
 .upload-bar-fill[data-status="syncing"] {
   background: var(--silver);
   opacity: 0.55;
+}
+.upload-cancel {
+  flex: none;
+  padding-inline: 8px;
 }
 
 /* ---- Shelf / file cards ---- */

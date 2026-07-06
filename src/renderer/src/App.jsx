@@ -21,6 +21,7 @@ import {
   Pencil,
   QrCode,
   RefreshCw,
+  Send,
   Server,
   Settings2,
   Shield,
@@ -36,6 +37,7 @@ import logoUrl from "./logo.png";
 import {
   PAGE_UPLOAD_LOCK_MS,
   STALE_UPLOAD_LOCK_MS,
+  STALLED_BACKGROUND_UPLOAD_MS,
   claimQueuedUpload,
   clearQueuedUpload,
   isUploadQueueSupported,
@@ -78,6 +80,7 @@ const apiDefault = {
   rawUploadUrl: "api/files/raw",
   downloadUrl: (id) => `api/files/${id}/download`,
   previewUrl: (id) => `api/files/${id}/preview`,
+  cancelUpload: (id) => request(`api/uploads/${id}`, { method: "DELETE" }),
   createFolder: (name) => request("api/folders", { method: "POST", body: JSON.stringify({ name }) }),
   renameFolder: (id, name) => request(`api/folders/${id}`, { method: "PATCH", body: JSON.stringify({ name }) }),
   clearFiles: () => request("api/files", { method: "DELETE" }),
@@ -96,6 +99,7 @@ function buildApi(baseUrl = "") {
     rawUploadUrl: join("api/files/raw"),
     downloadUrl: (id) => join(`api/files/${id}/download`),
     previewUrl: (id) => join(`api/files/${id}/preview`),
+    cancelUpload: (id) => request(join(`api/uploads/${id}`), { method: "DELETE" }),
     createFolder: (name) => request(join("api/folders"), { method: "POST", body: JSON.stringify({ name }) }),
     renameFolder: (id, name) => request(join(`api/folders/${id}`), { method: "PATCH", body: JSON.stringify({ name }) }),
     clearFiles: () => request(join("api/files"), { method: "DELETE" }),
@@ -124,6 +128,8 @@ export default function App() {
   const [pending, setPending] = useState([]);
   const [settings, setSettings] = useState({});
   const [uploads, setUploads] = useState([]);
+  const [textDraft, setTextDraft] = useState("");
+  const [textComposerOpen, setTextComposerOpen] = useState(false);
   const [createFolderUpload, setCreateFolderUpload] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(true);
@@ -215,7 +221,18 @@ export default function App() {
     notify(message, "warn");
   }, [notify]);
 
+  const abortBackgroundFetchUpload = useCallback(async (id) => {
+    if (!id || isDesktop) return false;
+    const bgFetch = await serviceWorkerRegistrationRef.current?.backgroundFetch
+      ?.get(id)
+      .catch(() => null);
+    if (!bgFetch?.abort) return false;
+    await bgFetch.abort();
+    return true;
+  }, [isDesktop]);
+
   const startBackgroundFetchUpload = useCallback(async (record) => {
+    if (isDesktop) return false;
     const registration = serviceWorkerRegistrationRef.current;
     if (!registration?.backgroundFetch?.fetch) return false;
     try {
@@ -242,7 +259,7 @@ export default function App() {
       await markQueuedUploadFailed(record.id, "Background fetch unavailable").catch(() => {});
       return false;
     }
-  }, []);
+  }, [isDesktop]);
 
   const drainQueuedUploads = useCallback(async () => {
     if (drainingUploadsRef.current || !api.rawUploadUrl || !isUploadQueueSupported()) return;
@@ -255,11 +272,18 @@ export default function App() {
       const queue = [...records];
       const runNext = async () => {
         while (queue.length) {
-          const record = queue.shift();
-          const activeBackgroundFetch = await serviceWorkerRegistrationRef.current?.backgroundFetch
-            ?.get(record.id)
-            .catch(() => null);
-          if (activeBackgroundFetch) continue;
+          let record = queue.shift();
+          const activeBackgroundFetch = isDesktop
+            ? null
+            : await serviceWorkerRegistrationRef.current?.backgroundFetch
+              ?.get(record.id)
+              .catch(() => null);
+          if (activeBackgroundFetch) {
+            if (!isStalledBackgroundUpload(record)) continue;
+            await activeBackgroundFetch.abort?.().catch(() => {});
+            const released = await releaseQueuedUpload(record.id, "Background upload stalled").catch(() => null);
+            record = released || { ...record, status: "queued", lockedUntil: 0 };
+          }
           const forceClaim = record.status === "syncing";
           if (forceClaim) {
             await releaseQueuedUpload(record.id, "Background fetch did not start").catch(() => {});
@@ -286,7 +310,7 @@ export default function App() {
       drainingUploadsRef.current = false;
       await refreshQueuedUploads();
     }
-  }, [api, notifyUploadPaused, refreshFiles, refreshQueuedUploads, registerBackgroundUpload]);
+  }, [api, isDesktop, notifyUploadPaused, refreshFiles, refreshQueuedUploads, registerBackgroundUpload]);
 
   useEffect(() => {
     if (!("serviceWorker" in navigator) || !window.isSecureContext) {
@@ -326,14 +350,18 @@ export default function App() {
     const onMessage = (event) => {
       const type = event.data?.type || "";
       if (!type.startsWith("WATERDROP_UPLOAD_")) return;
-      refreshFiles({ silent: true }).then(refreshQueuedUploads);
+      refreshFiles({ silent: true })
+        .then(refreshQueuedUploads)
+        .then(() => {
+          if (type === "WATERDROP_UPLOAD_QUEUED") drainQueuedUploads();
+        });
     };
     navigator.serviceWorker.addEventListener("message", onMessage);
     return () => {
       active = false;
       navigator.serviceWorker.removeEventListener("message", onMessage);
     };
-  }, [refreshFiles, refreshQueuedUploads, registerBackgroundUpload]);
+  }, [drainQueuedUploads, refreshFiles, refreshQueuedUploads, registerBackgroundUpload]);
 
   useEffect(() => {
     let mounted = true;
@@ -498,7 +526,9 @@ export default function App() {
       nextExpiry: files.reduce((min, file) => Math.min(min, file.expiresAt || Infinity), Infinity),
     };
   }, [files]);
-  const uploadModeTitle = uploadSupport.backgroundFetch
+  const uploadModeTitle = isDesktop
+    ? "Uploads run while WaterDrop is open."
+    : uploadSupport.backgroundFetch
     ? "Background uploads can continue through the browser task UI."
     : uploadSupport.backgroundSync
     ? "Queued uploads can retry in the background on this browser."
@@ -612,11 +642,11 @@ export default function App() {
     if (dragDepth.current === 0) setDragging(false);
   }
 
-  async function uploadFiles(picked) {
+  async function uploadFiles(picked, { groupSelection = createFolderUpload } = {}) {
     const valid = picked.filter(Boolean);
     if (!valid.length) return;
     let targetFolder = null;
-    if (createFolderUpload) {
+    if (groupSelection) {
       try {
         const result = await api.createFolder();
         targetFolder = result.folder;
@@ -668,6 +698,19 @@ export default function App() {
     }
   }
 
+  async function sendTextDraft(event) {
+    event.preventDefault();
+    if (!textDraft.trim()) return;
+    const file = createTextUploadFile(textDraft);
+    setTextDraft("");
+    setTextComposerOpen(false);
+    await uploadFiles([file], { groupSelection: false });
+  }
+
+  function clearTextDraft() {
+    setTextDraft("");
+  }
+
   async function dismissUpload(upload) {
     if (!upload) return;
     if (upload.queued) {
@@ -679,6 +722,30 @@ export default function App() {
       }
     }
     setUploads((items) => items.filter((item) => item.id !== upload.id));
+  }
+
+  async function cancelUpload(upload) {
+    if (!upload) return;
+    const name = upload.name || "this upload";
+    if (!window.confirm(`Cancel upload "${name}"?`)) return;
+    let serverError = null;
+    try {
+      if (upload.queued) await clearQueuedUpload(upload.id);
+      await abortBackgroundFetchUpload(upload.id).catch(() => {});
+      await api.cancelUpload?.(upload.id).catch((err) => {
+        serverError = err;
+      });
+      setUploads((items) => items.filter((item) => item.id !== upload.id));
+      notify(
+        serverError
+          ? "Upload cancelled locally. The server will ignore stale retries."
+          : "Upload cancelled",
+        serverError ? "warn" : "ok"
+      );
+      await refreshFiles({ silent: true });
+    } catch (err) {
+      notify(err.message || "Could not cancel upload", "warn");
+    }
   }
 
   function uploadOneLegacy(file, targetFolder = null) {
@@ -876,6 +943,17 @@ export default function App() {
     }
   }
 
+  async function copyFileText(file) {
+    if (!isTextFile(file)) return;
+    try {
+      const response = await fetch(api.previewUrl(file.id), { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      await copyText(await response.text(), "Text copied");
+    } catch (err) {
+      notify(err.message || "Copy failed", "warn");
+    }
+  }
+
   return (
     <>
       <div className="grain" aria-hidden="true" />
@@ -1062,6 +1140,54 @@ export default function App() {
             <span className="dz-title">{createFolderUpload ? "Drop files into a new folder" : "Drop files"}</span>
           </button>
 
+          <form
+            className={`text-compose ${textComposerOpen ? "is-open" : "is-collapsed"}`}
+            onSubmit={sendTextDraft}
+          >
+            <button
+              className="text-compose-head"
+              type="button"
+              onClick={() => setTextComposerOpen((open) => !open)}
+              aria-expanded={textComposerOpen}
+            >
+              <span className="text-compose-label">
+                <FileText size={16} />
+                <span className="mono small muted">Text</span>
+              </span>
+              <span className="text-compose-summary mono small faint">
+                {textDraft ? formatBytes(new Blob([textDraft]).size) : "Paste or type text"}
+              </span>
+              {textComposerOpen ? <ChevronDown size={16} /> : <Send size={16} />}
+            </button>
+            {textComposerOpen && (
+              <>
+                <textarea
+                  className="text-compose-input"
+                  value={textDraft}
+                  onChange={(event) => setTextDraft(event.target.value)}
+                  aria-label="Text to send"
+                  placeholder="Paste text..."
+                  rows={4}
+                  spellCheck={true}
+                  autoFocus
+                />
+                <div className="text-compose-actions">
+                  <button
+                    className="btn btn-ghost btn-xs"
+                    type="button"
+                    onClick={clearTextDraft}
+                    disabled={!textDraft}
+                  >
+                    <X size={13} /> Clear
+                  </button>
+                  <button className="btn btn-solid btn-xs" type="submit" disabled={!textDraft.trim()}>
+                    <Send size={13} /> Send Text
+                  </button>
+                </div>
+              </>
+            )}
+          </form>
+
           <label className="bulk-toggle">
             <input
               type="checkbox"
@@ -1099,6 +1225,11 @@ export default function App() {
                         style={{ width: `${upload.progress}%` }}
                       />
                     </div>
+                    {canCancelStalledUpload(upload) && (
+                      <button className="btn btn-ghost btn-xs upload-cancel" onClick={() => cancelUpload(upload)}>
+                        <X size={13} /> Cancel
+                      </button>
+                    )}
                     <span className="mono small muted">{formatBytes(upload.size)}</span>
                   </div>
                 </div>
@@ -1122,6 +1253,7 @@ export default function App() {
                   isDesktop={isDesktop}
                   key={file.id}
                   onCopyHash={() => copyText(file.sha256, "Hash copied")}
+                  onCopyText={() => copyFileText(file)}
                   onDelete={() => deleteFile(file)}
                   onDownload={() => downloadFile(file)}
                   onPreview={() => setPreviewFile(file)}
@@ -1144,6 +1276,7 @@ export default function App() {
           isDesktop={isDesktop}
           onClose={() => setPreviewFile(null)}
           onCopyImage={() => copyImage(previewFile)}
+          onCopyText={() => copyFileText(previewFile)}
           onDownload={() => downloadFile(previewFile)}
         />
       )}
@@ -1158,6 +1291,32 @@ function openExternal(url) {
   } else {
     window.open(url, "_blank", "noreferrer");
   }
+}
+
+function createTextUploadFile(text) {
+  const name = textUploadName(text);
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  try {
+    return new File([blob], name, { type: "text/plain", lastModified: Date.now() });
+  } catch {
+    blob.name = name;
+    blob.lastModified = Date.now();
+    return blob;
+  }
+}
+
+function textUploadName(text) {
+  const firstLine = String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+  const base = (firstLine || "Text")
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 48);
+  const stamp = new Date().toISOString().slice(0, 16).replace("T", " ").replace(":", ".");
+  return `${base || "Text"} ${stamp}.txt`;
 }
 
 function Onboarding({ network, servePublished, initialStartOnLogin, onPublish, onRefreshInfo, onFinish }) {
@@ -1471,6 +1630,7 @@ function FileCard({
   isDesktop,
   onCancelDelete,
   onCopyHash,
+  onCopyText,
   onDelete,
   onDownload,
   onPreview,
@@ -1483,6 +1643,7 @@ function FileCard({
   const isImage = isImageFile(file);
   const isVideo = isVideoFile(file);
   const isPdf = isPdfFile(file);
+  const isText = isTextFile(file);
   const title = isFolder ? "Open folder." : isDesktop ? "Click to preview. Drag to copy." : "Click to preview.";
   function onCardKeyDown(event) {
     if (event.key !== "Enter" && event.key !== " ") return;
@@ -1594,24 +1755,38 @@ function FileCard({
         onKeyDown={(event) => event.stopPropagation()}
       >
         {isDesktop ? (
-          <button className="btn btn-solid btn-xs" onClick={onDownload}>
-            <HardDriveDownload size={14} /> Save
-          </button>
+          <>
+            <button className="btn btn-solid btn-xs" onClick={onDownload}>
+              <HardDriveDownload size={14} /> Save
+            </button>
+            {isText && (
+              <button className="btn btn-ghost btn-xs" onClick={onCopyText}>
+                <Copy size={14} /> Copy
+              </button>
+            )}
+          </>
         ) : (
-          <a
-            className="btn btn-solid btn-xs"
-            href={api.downloadUrl(file.id)}
-            download
-            onClick={(event) => {
-              // Let the native download run for folders/small files; otherwise
-              // take over with the accelerated multi-connection download.
-              if (isFolder || !canParallelDownload(file)) return;
-              event.preventDefault();
-              onDownload();
-            }}
-          >
-            <Download size={14} /> Get
-          </a>
+          <>
+            <a
+              className="btn btn-solid btn-xs"
+              href={api.downloadUrl(file.id)}
+              download
+              onClick={(event) => {
+                // Let the native download run for folders/small files; otherwise
+                // take over with the accelerated multi-connection download.
+                if (isFolder || !canParallelDownload(file)) return;
+                event.preventDefault();
+                onDownload();
+              }}
+            >
+              <Download size={14} /> Get
+            </a>
+            {isText && (
+              <button className="btn btn-ghost btn-xs" onClick={onCopyText}>
+                <Copy size={14} /> Copy
+              </button>
+            )}
+          </>
         )}
         {confirmDelete ? (
           <span className="confirm">
@@ -1632,7 +1807,7 @@ function FileCard({
   );
 }
 
-function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onDownload }) {
+function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onCopyText, onDownload }) {
   const kind = previewKindFor(file);
   const previewUrl = kind === "folder" ? "" : api.previewUrl(file.id);
   const [contextMenu, setContextMenu] = useState(null);
@@ -1754,6 +1929,11 @@ function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onDownload }
             {isDesktop ? <HardDriveDownload size={14} /> : <Download size={14} />}
             {isDesktop ? "Save" : "Get"}
           </button>
+          {kind === "text" && (
+            <button className="btn btn-ghost btn-sm" onClick={onCopyText}>
+              <Copy size={14} /> Copy
+            </button>
+          )}
           {kind !== "folder" && (
             <a className="btn btn-ghost btn-sm" href={previewUrl} target="_blank" rel="noreferrer">
               <ExternalLink size={14} /> Open
@@ -2041,6 +2221,16 @@ function uploadStatusText(upload) {
 
 function canDismissUpload(upload) {
   return upload.status === "queued" || upload.status === "error";
+}
+
+function canCancelStalledUpload(upload) {
+  return upload?.queued && upload.status === "syncing" && isStalledBackgroundUpload(upload);
+}
+
+function isStalledBackgroundUpload(upload) {
+  if (!upload || upload.status !== "syncing") return false;
+  const startedAt = Number(upload.syncStartedAt || upload.updatedAt || upload.createdAt || 0);
+  return Boolean(startedAt && Date.now() - startedAt >= STALLED_BACKGROUND_UPLOAD_MS);
 }
 
 function isWaterDropDrag(event) {
