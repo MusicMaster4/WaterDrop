@@ -57,6 +57,7 @@ async function drainUploadQueue() {
       progress: Math.max(1, Number(record.progress || 0)),
       updatedAt: now,
       lockedUntil: now + WORKER_LOCK_MS,
+      syncStartedAt: record.status === "syncing" ? Number(record.syncStartedAt || now) : now,
       lastError: "",
     };
     if (!await putUploadRecord(claimed)) continue;
@@ -269,6 +270,7 @@ async function getUploadRecord(id) {
 async function markUploadQueued(id, message, knownRecord = null) {
   const record = knownRecord || await getUploadRecord(id);
   if (!record) return;
+  if (!knownRecord && record.status !== "syncing") return;
   const queued = await putUploadRecord({
     ...record,
     status: "queued",
@@ -276,6 +278,7 @@ async function markUploadQueued(id, message, knownRecord = null) {
     attempts: Number(record.attempts || 0) + 1,
     updatedAt: Date.now(),
     lockedUntil: 0,
+    syncStartedAt: 0,
     lastError: message || "Upload paused",
   });
   if (!queued) return;

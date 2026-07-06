@@ -5,6 +5,7 @@ const CANCELLED_UPLOAD_TOMBSTONE_MS = 7 * 24 * 60 * 60 * 1000;
 
 export const PAGE_UPLOAD_LOCK_MS = 45 * 1000;
 export const STALE_UPLOAD_LOCK_MS = 2 * PAGE_UPLOAD_LOCK_MS;
+export const STALLED_BACKGROUND_UPLOAD_MS = 60 * 1000;
 export const UPLOAD_SYNC_TAG = "waterdrop-upload-queue";
 
 let dbPromise = null;
@@ -88,6 +89,7 @@ export async function claimQueuedUpload(id, { force = false } = {}) {
     progress: Math.max(1, Number(record.progress || 0)),
     updatedAt: now,
     lockedUntil: now + PAGE_UPLOAD_LOCK_MS,
+    syncStartedAt: 0,
     lastError: "",
   };
   return await putUploadRecord(claimed) ? claimed : null;
@@ -102,6 +104,7 @@ export async function releaseQueuedUpload(id, message = "") {
     progress: Math.max(1, Number(record.progress || 0)),
     updatedAt: Date.now(),
     lockedUntil: 0,
+    syncStartedAt: 0,
     lastError: message || record.lastError || "",
   };
   return await putUploadRecord(released) ? released : null;
@@ -139,6 +142,7 @@ export async function markQueuedUploadFailed(id, message) {
     attempts: Number(record.attempts || 0) + 1,
     updatedAt: Date.now(),
     lockedUntil: 0,
+    syncStartedAt: 0,
     lastError: message || "Upload paused",
   };
   return await putUploadRecord(updated) ? updated : null;
@@ -147,12 +151,14 @@ export async function markQueuedUploadFailed(id, message) {
 export async function markQueuedUploadSyncing(id) {
   const record = await getUploadRecord(id);
   if (!record) return null;
+  const now = Date.now();
   const updated = {
     ...record,
     status: "syncing",
     progress: Math.max(1, Number(record.progress || 0)),
-    updatedAt: Date.now(),
-    lockedUntil: Date.now() + 2 * PAGE_UPLOAD_LOCK_MS,
+    updatedAt: now,
+    lockedUntil: now + 2 * PAGE_UPLOAD_LOCK_MS,
+    syncStartedAt: record.status === "syncing" ? Number(record.syncStartedAt || now) : now,
     lastError: "",
   };
   return await putUploadRecord(updated) ? updated : null;
@@ -224,6 +230,8 @@ export function uploadRecordToView(record) {
     status: record.status || "queued",
     attempts: Number(record.attempts || 0),
     createdAt: Number(record.createdAt || 0),
+    updatedAt: Number(record.updatedAt || 0),
+    syncStartedAt: Number(record.syncStartedAt || 0),
     folderId: record.folderId || "",
     folderName: record.folderName || "",
     queued: true,

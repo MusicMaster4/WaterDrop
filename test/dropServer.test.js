@@ -318,6 +318,72 @@ test("pending upload placeholder clears once the file lands", async () => {
   }
 });
 
+test("cancelled in-flight uploads clear placeholders and reject stale retries", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-cancel-upload-test-"));
+  const rendererDir = path.join(root, "renderer");
+  const dataDir = path.join(root, "data");
+  const downloads = path.join(root, "downloads");
+  await fs.mkdir(rendererDir, { recursive: true });
+  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>WaterDrop</title>");
+
+  const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 48010 });
+  try {
+    const id = "44444444-4444-4444-8444-444444444444";
+    server.store.addPendingUpload({ id, name: "stuck.txt", size: 2 });
+
+    const before = await (await fetch(new URL("api/files", server.localUrl))).json();
+    assert.equal(before.pending.length, 1);
+
+    const cancelled = await fetch(new URL(`api/uploads/${id}`, server.localUrl), { method: "DELETE" });
+    assert.equal(cancelled.status, 200);
+    const cancelledBody = await cancelled.json();
+    assert.equal(cancelledBody.cancelled, true);
+
+    const afterCancel = await (await fetch(new URL("api/files", server.localUrl))).json();
+    assert.equal(afterCancel.pending.length, 0);
+    assert.equal(afterCancel.deletedUploads.includes(id), true);
+
+    const staleRetry = await fetch(new URL("api/files/raw", server.localUrl), {
+      method: "POST",
+      body: new Blob(["stale"], { type: "text/plain" }),
+      headers: {
+        "Content-Type": "text/plain",
+        "X-WaterDrop-File-Name": encodeURIComponent("stuck.txt"),
+        "X-WaterDrop-Mime-Type": "text/plain",
+        "X-WaterDrop-Upload-Id": id,
+      },
+    });
+    assert.equal(staleRetry.status, 200);
+    const staleRetryBody = await staleRetry.json();
+    assert.equal(staleRetryBody.deleted, true);
+    assert.equal(staleRetryBody.files.length, 0);
+  } finally {
+    await server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("startup removes stale upload temp files from previous instances", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-temp-cleanup-test-"));
+  const rendererDir = path.join(root, "renderer");
+  const dataDir = path.join(root, "data");
+  const downloads = path.join(root, "downloads");
+  const tmpDir = path.join(dataDir, "tmp");
+  await fs.mkdir(rendererDir, { recursive: true });
+  await fs.mkdir(tmpDir, { recursive: true });
+  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>WaterDrop</title>");
+  await fs.writeFile(path.join(tmpDir, "stale.upload"), "partial");
+
+  const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 48011 });
+  try {
+    const entries = await fs.readdir(tmpDir);
+    assert.deepEqual(entries, []);
+  } finally {
+    await server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("deleted uploads are not recreated by stale queued retries", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-deleted-retry-test-"));
   const rendererDir = path.join(root, "renderer");
