@@ -767,6 +767,10 @@ body::before {
   background: var(--silver);
   opacity: 0.55;
 }
+.upload-cancel {
+  flex: none;
+  padding-inline: 8px;
+}
 
 /* ---- Shelf / file cards ---- */
 .shelf {

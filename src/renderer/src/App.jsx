@@ -37,6 +37,7 @@ import logoUrl from "./logo.png";
 import {
   PAGE_UPLOAD_LOCK_MS,
   STALE_UPLOAD_LOCK_MS,
+  STALLED_BACKGROUND_UPLOAD_MS,
   claimQueuedUpload,
   clearQueuedUpload,
   isUploadQueueSupported,
@@ -79,6 +80,7 @@ const apiDefault = {
   rawUploadUrl: "api/files/raw",
   downloadUrl: (id) => `api/files/${id}/download`,
   previewUrl: (id) => `api/files/${id}/preview`,
+  cancelUpload: (id) => request(`api/uploads/${id}`, { method: "DELETE" }),
   createFolder: (name) => request("api/folders", { method: "POST", body: JSON.stringify({ name }) }),
   renameFolder: (id, name) => request(`api/folders/${id}`, { method: "PATCH", body: JSON.stringify({ name }) }),
   clearFiles: () => request("api/files", { method: "DELETE" }),
@@ -97,6 +99,7 @@ function buildApi(baseUrl = "") {
     rawUploadUrl: join("api/files/raw"),
     downloadUrl: (id) => join(`api/files/${id}/download`),
     previewUrl: (id) => join(`api/files/${id}/preview`),
+    cancelUpload: (id) => request(join(`api/uploads/${id}`), { method: "DELETE" }),
     createFolder: (name) => request(join("api/folders"), { method: "POST", body: JSON.stringify({ name }) }),
     renameFolder: (id, name) => request(join(`api/folders/${id}`), { method: "PATCH", body: JSON.stringify({ name }) }),
     clearFiles: () => request(join("api/files"), { method: "DELETE" }),
@@ -218,6 +221,16 @@ export default function App() {
     notify(message, "warn");
   }, [notify]);
 
+  const abortBackgroundFetchUpload = useCallback(async (id) => {
+    if (!id || isDesktop) return false;
+    const bgFetch = await serviceWorkerRegistrationRef.current?.backgroundFetch
+      ?.get(id)
+      .catch(() => null);
+    if (!bgFetch?.abort) return false;
+    await bgFetch.abort();
+    return true;
+  }, [isDesktop]);
+
   const startBackgroundFetchUpload = useCallback(async (record) => {
     if (isDesktop) return false;
     const registration = serviceWorkerRegistrationRef.current;
@@ -259,13 +272,18 @@ export default function App() {
       const queue = [...records];
       const runNext = async () => {
         while (queue.length) {
-          const record = queue.shift();
+          let record = queue.shift();
           const activeBackgroundFetch = isDesktop
             ? null
             : await serviceWorkerRegistrationRef.current?.backgroundFetch
               ?.get(record.id)
               .catch(() => null);
-          if (activeBackgroundFetch) continue;
+          if (activeBackgroundFetch) {
+            if (!isStalledBackgroundUpload(record)) continue;
+            await activeBackgroundFetch.abort?.().catch(() => {});
+            const released = await releaseQueuedUpload(record.id, "Background upload stalled").catch(() => null);
+            record = released || { ...record, status: "queued", lockedUntil: 0 };
+          }
           const forceClaim = record.status === "syncing";
           if (forceClaim) {
             await releaseQueuedUpload(record.id, "Background fetch did not start").catch(() => {});
@@ -704,6 +722,30 @@ export default function App() {
       }
     }
     setUploads((items) => items.filter((item) => item.id !== upload.id));
+  }
+
+  async function cancelUpload(upload) {
+    if (!upload) return;
+    const name = upload.name || "this upload";
+    if (!window.confirm(`Cancel upload "${name}"?`)) return;
+    let serverError = null;
+    try {
+      if (upload.queued) await clearQueuedUpload(upload.id);
+      await abortBackgroundFetchUpload(upload.id).catch(() => {});
+      await api.cancelUpload?.(upload.id).catch((err) => {
+        serverError = err;
+      });
+      setUploads((items) => items.filter((item) => item.id !== upload.id));
+      notify(
+        serverError
+          ? "Upload cancelled locally. The server will ignore stale retries."
+          : "Upload cancelled",
+        serverError ? "warn" : "ok"
+      );
+      await refreshFiles({ silent: true });
+    } catch (err) {
+      notify(err.message || "Could not cancel upload", "warn");
+    }
   }
 
   function uploadOneLegacy(file, targetFolder = null) {
@@ -1183,6 +1225,11 @@ export default function App() {
                         style={{ width: `${upload.progress}%` }}
                       />
                     </div>
+                    {canCancelStalledUpload(upload) && (
+                      <button className="btn btn-ghost btn-xs upload-cancel" onClick={() => cancelUpload(upload)}>
+                        <X size={13} /> Cancel
+                      </button>
+                    )}
                     <span className="mono small muted">{formatBytes(upload.size)}</span>
                   </div>
                 </div>
@@ -2174,6 +2221,16 @@ function uploadStatusText(upload) {
 
 function canDismissUpload(upload) {
   return upload.status === "queued" || upload.status === "error";
+}
+
+function canCancelStalledUpload(upload) {
+  return upload?.queued && upload.status === "syncing" && isStalledBackgroundUpload(upload);
+}
+
+function isStalledBackgroundUpload(upload) {
+  if (!upload || upload.status !== "syncing") return false;
+  const startedAt = Number(upload.syncStartedAt || upload.updatedAt || upload.createdAt || 0);
+  return Boolean(startedAt && Date.now() - startedAt >= STALLED_BACKGROUND_UPLOAD_MS);
 }
 
 function isWaterDropDrag(event) {

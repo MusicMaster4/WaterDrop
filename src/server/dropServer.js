@@ -76,6 +76,7 @@ class FileStore extends EventEmitter {
     await fsp.mkdir(this.filesDir, { recursive: true });
     await fsp.mkdir(this.tmpDir, { recursive: true });
     await fsp.mkdir(this.dragDir, { recursive: true });
+    await this.cleanupTemporaryUploads();
     await this.load();
     await this.cleanupExpired();
   }
@@ -322,6 +323,36 @@ class FileStore extends EventEmitter {
     }
     if (changed) this.notifyFilesChanged(reason);
     return changed;
+  }
+
+  async cancelUpload(id) {
+    if (!isValidFileId(id)) return { ok: false, cancelled: false, reason: "invalid-id" };
+    if (this.get(id)) return { ok: true, cancelled: false, completed: true };
+    await this.rememberDeletedUploads([id]);
+    const changed = await this.cancelInFlightUploads([id], "upload-cancelled");
+    await this.removeUploadTempFiles(id);
+    if (!changed) this.notifyFilesChanged("upload-cancelled");
+    return { ok: true, cancelled: true };
+  }
+
+  async cleanupTemporaryUploads() {
+    await removeDirIfExists(this.tmpDir);
+    await fsp.mkdir(this.tmpDir, { recursive: true });
+  }
+
+  async removeUploadTempFiles(id) {
+    if (!isValidFileId(id)) return;
+    let entries;
+    try {
+      entries = await fsp.readdir(this.tmpDir);
+    } catch {
+      return;
+    }
+    const prefix = `${id}.`;
+    const names = entries.filter(
+      (name) => name === `${id}.chunked.upload` || (name.startsWith(prefix) && name.endsWith(".upload"))
+    );
+    await Promise.allSettled(names.map((name) => removeIfExists(path.join(this.tmpDir, name))));
   }
 
   // --- Chunked (parallel) upload assembly ---------------------------------
@@ -798,6 +829,15 @@ async function handleApi({ req, res, relative, store, getPort, getHttpsPort, eve
     const deleted = await store.clear();
     sendJson(res, 200, { ok: true, deleted });
     return;
+  }
+
+  const uploadMatch = relative.match(/^\/api\/uploads\/([a-f0-9-]+)$/);
+  if (uploadMatch) {
+    if (req.method === "DELETE") {
+      const result = await store.cancelUpload(uploadMatch[1]);
+      sendJson(res, result.ok ? 200 : 400, result.ok ? result : { error: "Invalid upload id" });
+      return;
+    }
   }
 
   const folderMatch = relative.match(/^\/api\/folders\/([a-f0-9-]+)$/);
