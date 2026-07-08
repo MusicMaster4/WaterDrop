@@ -1342,9 +1342,6 @@ body::before {
     flex: 1;
     min-width: 0;
   }
-  .file-actions .icon-btn {
-    flex-shrink: 0;
-  }
 }
 
 /* Reduced motion: honor the OS setting, keep idle work nil. */
