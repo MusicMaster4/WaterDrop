@@ -116,6 +116,7 @@ export default function App() {
   const serviceWorkerRegistrationRef = useRef(null);
   const drainingUploadsRef = useRef(false);
   const lastUploadPauseNoticeRef = useRef(0);
+  const downloadAbortRef = useRef(new Map());
   // When the direct HTTPS origin is reachable, bulk transfers are routed through
   // it (HTTP/1.1 -> real parallel connections). Null means "use this page's
   // origin" (e.g. Tailscale Serve). Held in a ref so it can change mid-session
@@ -128,6 +129,7 @@ export default function App() {
   const [pending, setPending] = useState([]);
   const [settings, setSettings] = useState({});
   const [uploads, setUploads] = useState([]);
+  const [downloads, setDownloads] = useState([]);
   const [textDraft, setTextDraft] = useState("");
   const [textComposerOpen, setTextComposerOpen] = useState(false);
   const [createFolderUpload, setCreateFolderUpload] = useState(false);
@@ -826,29 +828,70 @@ export default function App() {
 
   // Accelerated multi-connection download with a plain native download as the
   // fallback for folders, small files, unsupported browsers, or any error.
+  // Progress is shown as a stable card with a bar (not re-toasted every tick).
   async function browserDownload(file) {
     if (shouldAccelerateDownload(file)) {
-      let lastPct = -100;
+      const downloadId = crypto.randomUUID();
+      const controller = new AbortController();
+      downloadAbortRef.current.set(downloadId, controller);
+      setDownloads((items) => [
+        ...items,
+        {
+          id: downloadId,
+          name: file.name || "download",
+          size: file.size || 0,
+          progress: 1,
+          status: "downloading",
+          createdAt: Date.now(),
+        },
+      ]);
       const base = transferBaseRef.current;
       const url = base ? new URL(`api/files/${file.id}/download`, base).toString() : api.downloadUrl(file.id);
       try {
-        notify(`Downloading ${file.name}…`, "info");
         await parallelDownload(file, url, {
+          signal: controller.signal,
           onProgress: (pct) => {
-            if (pct - lastPct >= 10) {
-              lastPct = pct;
-              notify(`Downloading ${file.name} — ${pct}%`, "info");
-            }
+            const progress = Math.max(1, Math.min(99, pct));
+            setDownloads((items) =>
+              items.map((item) => (item.id === downloadId ? { ...item, progress } : item))
+            );
           },
         });
+        setDownloads((items) =>
+          items.map((item) =>
+            item.id === downloadId ? { ...item, progress: 100, status: "done" } : item
+          )
+        );
+        window.setTimeout(() => {
+          setDownloads((items) => items.filter((item) => item.id !== downloadId));
+        }, 2200);
         notify("Download complete", "ok");
         window.setTimeout(() => refreshFiles({ silent: true }), 500);
         return;
-      } catch {
+      } catch (err) {
+        setDownloads((items) => items.filter((item) => item.id !== downloadId));
+        if (err?.name === "AbortError") {
+          notify("Download cancelled", "info");
+          return;
+        }
         // Fall through to the native download below.
+      } finally {
+        downloadAbortRef.current.delete(downloadId);
       }
     }
     nativeDownload(file);
+  }
+
+  function cancelDownload(download) {
+    if (!download?.id) return;
+    downloadAbortRef.current.get(download.id)?.abort();
+  }
+
+  function dismissDownload(download) {
+    if (!download?.id) return;
+    downloadAbortRef.current.get(download.id)?.abort();
+    downloadAbortRef.current.delete(download.id);
+    setDownloads((items) => items.filter((item) => item.id !== download.id));
   }
 
   function nativeDownload(file) {
@@ -1202,8 +1245,38 @@ export default function App() {
 
           <input ref={fileInputRef} type="file" multiple hidden onChange={onFilesPicked} />
 
-          {uploads.length > 0 && (
+          {(downloads.length > 0 || uploads.length > 0) && (
             <div className="uploads">
+              {downloads.map((download) => (
+                <div className="upload-row" key={download.id}>
+                  <div className="upload-top">
+                    <span className="upload-name" title={download.name}>{download.name}</span>
+                    <span className={`upload-status mono small ${download.status === "done" ? "ok" : ""}`}>
+                      {downloadStatusText(download)}
+                    </span>
+                    {download.status === "done" && (
+                      <button className="icon-btn upload-dismiss" title="Dismiss" onClick={() => dismissDownload(download)}>
+                        <X size={14} />
+                      </button>
+                    )}
+                  </div>
+                  <div className="upload-tail">
+                    <div className="upload-bar">
+                      <div
+                        className="upload-bar-fill"
+                        data-status={download.status === "done" ? "done" : "downloading"}
+                        style={{ width: `${download.progress || 0}%` }}
+                      />
+                    </div>
+                    {download.status === "downloading" && (
+                      <button className="btn btn-ghost btn-xs upload-cancel" onClick={() => cancelDownload(download)}>
+                        <X size={13} /> Cancel
+                      </button>
+                    )}
+                    <span className="mono small muted">{formatBytes(download.size)}</span>
+                  </div>
+                </div>
+              ))}
               {uploads.map((upload) => (
                 <div className="upload-row" key={upload.id}>
                   <div className="upload-top">
@@ -2217,6 +2290,11 @@ function uploadStatusText(upload) {
   if (upload.status === "queued") return "queued";
   if (upload.status === "syncing") return "syncing";
   return `${upload.progress || 0}%`;
+}
+
+function downloadStatusText(download) {
+  if (download.status === "done") return "done";
+  return `${download.progress || 0}%`;
 }
 
 function canDismissUpload(upload) {
