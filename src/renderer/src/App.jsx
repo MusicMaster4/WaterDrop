@@ -874,6 +874,7 @@ export default function App() {
           notify("Download cancelled", "info");
           return;
         }
+        notify("Download error — retrying with browser", "warn");
         // Fall through to the native download below.
       } finally {
         downloadAbortRef.current.delete(downloadId);
