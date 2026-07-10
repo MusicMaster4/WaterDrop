@@ -767,6 +767,9 @@ body::before {
   background: var(--silver);
   opacity: 0.55;
 }
+.upload-bar-fill[data-status="downloading"] {
+  background: var(--ink);
+}
 .upload-cancel {
   flex: none;
   padding-inline: 8px;
