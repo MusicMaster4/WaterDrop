@@ -266,6 +266,12 @@ function wireIpc() {
         dropServer.store.settings[key] = Boolean(patch[key]);
       }
     }
+    if (Object.prototype.hasOwnProperty.call(patch || {}, "retentionDays")) {
+      const days = Number(patch.retentionDays);
+      if (Number.isFinite(days)) {
+        dropServer.store.settings.retentionDays = Math.min(30, Math.max(1, Math.round(days)));
+      }
+    }
     await dropServer.store.saveSettings();
     applyLoginSettings();
     return {
