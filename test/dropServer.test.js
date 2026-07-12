@@ -740,3 +740,70 @@ async function waitForDownloads(base, id, expected) {
   }
   assert.fail(`Timed out waiting for ${expected} downloads`);
 }
+
+test("renames files, honors retention settings, and answers 304 for matching ETags", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "waterdrop-test-"));
+  const rendererDir = path.join(root, "renderer");
+  const dataDir = path.join(root, "data");
+  const downloads = path.join(root, "downloads");
+  await fs.mkdir(rendererDir, { recursive: true });
+  await fs.writeFile(path.join(rendererDir, "index.html"), "<!doctype html><title>WaterDrop</title>");
+
+  const server = await createDropServer({ dataDir, defaultDownloadDir: downloads, rendererDir, port: 47990 });
+  try {
+    const base = server.localUrl;
+
+    server.store.settings.retentionDays = 1;
+    const before = Date.now();
+    const upload = await fetch(new URL("api/files/raw", base), {
+      method: "POST",
+      body: new Blob(["retention"], { type: "text/plain" }),
+      headers: {
+        "Content-Type": "text/plain",
+        "X-WaterDrop-File-Name": encodeURIComponent("keepme.txt"),
+        "X-WaterDrop-Mime-Type": "text/plain",
+      },
+    });
+    assert.equal(upload.status, 201);
+    const uploaded = (await upload.json()).files[0];
+    const oneDay = 24 * 60 * 60 * 1000;
+    assert.ok(uploaded.expiresAt >= before + oneDay - 1000);
+    assert.ok(uploaded.expiresAt <= Date.now() + oneDay + 1000);
+
+    const info = await fetch(new URL("api/info", base));
+    assert.equal((await info.json()).retentionDays, 1);
+
+    const renamed = await fetch(new URL(`api/files/${uploaded.id}`, base), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "renamed.txt" }),
+    });
+    assert.equal(renamed.status, 200);
+    assert.equal((await renamed.json()).file.name, "renamed.txt");
+
+    const missingRename = await fetch(new URL("api/files/33333333-3333-4333-8333-333333333333", base), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "nope.txt" }),
+    });
+    assert.equal(missingRename.status, 404);
+
+    const preview = await fetch(new URL(`api/files/${uploaded.id}/preview`, base));
+    assert.equal(preview.status, 200);
+    const etag = preview.headers.get("etag");
+    assert.ok(etag);
+    await preview.arrayBuffer();
+
+    const cached = await fetch(new URL(`api/files/${uploaded.id}/preview`, base), {
+      headers: { "If-None-Match": etag },
+    });
+    assert.equal(cached.status, 304);
+    assert.equal((await cached.arrayBuffer()).byteLength, 0);
+
+    const files = await fetch(new URL("api/files", base));
+    assert.equal((await files.json()).files[0].downloads, 0);
+  } finally {
+    await server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

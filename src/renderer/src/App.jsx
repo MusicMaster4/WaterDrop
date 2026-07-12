@@ -16,11 +16,13 @@ import {
   Folder,
   HardDriveDownload,
   Info,
+  Link2,
   MonitorUp,
   MoreHorizontal,
   Pencil,
   QrCode,
   RefreshCw,
+  Search,
   Send,
   Server,
   Settings2,
@@ -83,6 +85,7 @@ const apiDefault = {
   cancelUpload: (id) => request(`api/uploads/${id}`, { method: "DELETE" }),
   createFolder: (name) => request("api/folders", { method: "POST", body: JSON.stringify({ name }) }),
   renameFolder: (id, name) => request(`api/folders/${id}`, { method: "PATCH", body: JSON.stringify({ name }) }),
+  renameFile: (id, name) => request(`api/files/${id}`, { method: "PATCH", body: JSON.stringify({ name }) }),
   clearFiles: () => request("api/files", { method: "DELETE" }),
   deleteFile: (id) => request(`api/files/${id}`, { method: "DELETE" }),
   configureServe: () => request("api/tailscale/serve", { method: "POST" }),
@@ -102,6 +105,7 @@ function buildApi(baseUrl = "") {
     cancelUpload: (id) => request(join(`api/uploads/${id}`), { method: "DELETE" }),
     createFolder: (name) => request(join("api/folders"), { method: "POST", body: JSON.stringify({ name }) }),
     renameFolder: (id, name) => request(join(`api/folders/${id}`), { method: "PATCH", body: JSON.stringify({ name }) }),
+    renameFile: (id, name) => request(join(`api/files/${id}`), { method: "PATCH", body: JSON.stringify({ name }) }),
     clearFiles: () => request(join("api/files"), { method: "DELETE" }),
     deleteFile: (id) => request(join(`api/files/${id}`), { method: "DELETE" }),
     configureServe: () => request(join("api/tailscale/serve"), { method: "POST" }),
@@ -132,6 +136,8 @@ export default function App() {
   const [downloads, setDownloads] = useState([]);
   const [textDraft, setTextDraft] = useState("");
   const [textComposerOpen, setTextComposerOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [sortBy, setSortBy] = useState("recent");
   const [createFolderUpload, setCreateFolderUpload] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(true);
@@ -153,10 +159,11 @@ export default function App() {
     if (!message) return;
     if (noticeTimeoutRef.current) window.clearTimeout(noticeTimeoutRef.current);
     setNotice({ id: crypto.randomUUID(), message, kind, action });
+    // Warnings stay visible longer — they usually need the user to act.
     noticeTimeoutRef.current = window.setTimeout(() => {
       setNotice(null);
       noticeTimeoutRef.current = null;
-    }, 4800);
+    }, kind === "warn" ? 8000 : 4800);
   }, []);
 
   useEffect(() => () => {
@@ -545,6 +552,48 @@ export default function App() {
     [pending, files]
   );
 
+  // Shelf view: filter by the search box, then apply the chosen sort order.
+  const visibleFiles = useMemo(() => {
+    const term = query.trim().toLowerCase();
+    const matched = term
+      ? files.filter((file) => String(file.name || "").toLowerCase().includes(term))
+      : files;
+    if (sortBy === "name") {
+      return [...matched].sort((a, b) =>
+        String(a.name || "").localeCompare(String(b.name || ""), undefined, { sensitivity: "base" })
+      );
+    }
+    if (sortBy === "size") {
+      return [...matched].sort((a, b) => Number(b.size || 0) - Number(a.size || 0));
+    }
+    return matched; // "recent": the server already lists newest first
+  }, [files, query, sortBy]);
+
+  // Re-render once a minute so the "expires in" countdowns stay honest without
+  // any network traffic.
+  const [, setClockTick] = useState(0);
+  useEffect(() => {
+    const timer = window.setInterval(() => setClockTick((tick) => tick + 1), 60 * 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  // Paste-to-upload: Ctrl+V with files/images on the clipboard drops them on the
+  // shelf. Pastes aimed at inputs (search box, text composer) are left alone.
+  const uploadFilesRef = useRef(null);
+  uploadFilesRef.current = uploadFiles;
+  useEffect(() => {
+    const onPaste = (event) => {
+      const target = event.target;
+      if (target?.closest?.("input, textarea, [contenteditable]")) return;
+      const pasted = Array.from(event.clipboardData?.files || []);
+      if (!pasted.length) return;
+      event.preventDefault();
+      uploadFilesRef.current?.(pasted);
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, []);
+
   async function copyText(text, label = "Copied") {
     if (!text) return;
     try {
@@ -906,20 +955,31 @@ export default function App() {
     window.setTimeout(() => refreshFiles({ silent: true }), 1000);
   }
 
-  async function renameFolder(file) {
-    if (!isFolderEntry(file)) return;
-    const nextName = window.prompt("Folder name", file.name);
+  async function renameEntry(file) {
+    const isFolder = isFolderEntry(file);
+    const nextName = window.prompt(isFolder ? "Folder name" : "File name", file.name);
     if (nextName === null) return;
     const trimmed = nextName.trim();
     if (!trimmed || trimmed === file.name) return;
     try {
-      const result = await api.renameFolder(file.id, trimmed);
-      setFiles((items) => items.map((item) => (item.id === file.id ? result.folder : item)));
-      if (previewFile?.id === file.id) setPreviewFile(result.folder);
-      notify("Folder renamed", "ok");
+      const result = isFolder
+        ? await api.renameFolder(file.id, trimmed)
+        : await api.renameFile(file.id, trimmed);
+      const renamed = result.folder || result.file;
+      setFiles((items) => items.map((item) => (item.id === file.id ? renamed : item)));
+      if (previewFile?.id === file.id) setPreviewFile(renamed);
+      notify(isFolder ? "Folder renamed" : "File renamed", "ok");
     } catch (err) {
       notify(err.message || "Rename failed", "warn");
     }
+  }
+
+  // Absolute download link built on the phone-reachable URL, so a copied link
+  // works on any device in the tailnet, not just this one.
+  function copyFileLink(file) {
+    const base = preferredUrl || window.location.href;
+    const root = base.endsWith("/") ? base : `${base}/`;
+    copyText(new URL(`api/files/${file.id}/download`, root).toString(), "Link copied");
   }
 
   function startExternalDrag(file, event) {
@@ -1080,6 +1140,23 @@ export default function App() {
                   onChange={(event) => updateSetting({ minimizeToTray: event.target.checked })}
                 />
               </label>
+              <label className="toggle-row">
+                <span>
+                  <span className="toggle-title">Keep files for</span>
+                  <span className="toggle-sub mono small muted">Shelf auto-expiry.</span>
+                </span>
+                <select
+                  className="settings-select mono small"
+                  value={Number(settings.retentionDays) || 7}
+                  onChange={(event) => updateSetting({ retentionDays: Number(event.target.value) })}
+                >
+                  <option value={1}>1 day</option>
+                  <option value={3}>3 days</option>
+                  <option value={7}>7 days</option>
+                  <option value={14}>14 days</option>
+                  <option value={30}>30 days</option>
+                </select>
+              </label>
               <div className="update-row">
                 <span className="mono small muted">
                   v{formatAppVersion(update?.currentVersion || appInfo?.version || "?")}
@@ -1115,7 +1192,7 @@ export default function App() {
               <span className="sep" />
               <span>{formatBytes(stats.totalBytes)}</span>
               <span className="sep" />
-              <span>{Number.isFinite(stats.nextExpiry) ? `next ${timeLeft(stats.nextExpiry)}` : "7 day shelf"}</span>
+              <span>{Number.isFinite(stats.nextExpiry) ? `next ${timeLeft(stats.nextExpiry)}` : `${Number(settings.retentionDays) || 7} day shelf`}</span>
             </div>
             <div className="work-head-actions">
               <button className="icon-btn" title="Refresh files" onClick={refreshFiles}>
@@ -1144,7 +1221,11 @@ export default function App() {
           </div>
 
           {notice && (
-            <div className={`status-line ${notice.kind === "warn" ? "is-warn" : notice.kind === "ok" ? "is-ok" : ""}`}>
+            <div
+              className={`status-line ${notice.kind === "warn" ? "is-warn" : notice.kind === "ok" ? "is-ok" : ""}`}
+              role="status"
+              aria-live="polite"
+            >
               <span className={`dot ${notice.kind === "ok" ? "dot-ok" : notice.kind === "warn" ? "dot-warn" : "dot-idle"}`} />
               <span>{notice.message}</span>
               {notice.action && (
@@ -1274,7 +1355,7 @@ export default function App() {
                         <X size={13} /> Cancel
                       </button>
                     )}
-                    <span className="mono small muted">{formatBytes(download.size)}</span>
+                    <TransferMeta item={download} activeStatus="downloading" />
                   </div>
                 </div>
               ))}
@@ -1304,22 +1385,54 @@ export default function App() {
                         <X size={13} /> Cancel
                       </button>
                     )}
-                    <span className="mono small muted">{formatBytes(upload.size)}</span>
+                    <TransferMeta item={upload} activeStatus="uploading" />
                   </div>
                 </div>
               ))}
             </div>
           )}
 
+          {files.length > 0 && (
+            <div className="shelf-tools">
+              <label className="shelf-search">
+                <Search size={14} aria-hidden="true" />
+                <input
+                  type="search"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder="Search files..."
+                  aria-label="Search files"
+                />
+                {query && (
+                  <button className="shelf-search-clear" type="button" title="Clear search" onClick={() => setQuery("")}>
+                    <X size={14} />
+                  </button>
+                )}
+              </label>
+              <select
+                className="settings-select mono small"
+                value={sortBy}
+                onChange={(event) => setSortBy(event.target.value)}
+                aria-label="Sort files"
+              >
+                <option value="recent">Newest</option>
+                <option value="name">Name</option>
+                <option value="size">Size</option>
+              </select>
+            </div>
+          )}
+
           <section className="shelf">
             {files.length === 0 && placeholders.length === 0 ? (
               <div className="empty">NO FILES ON THE SHELF</div>
+            ) : visibleFiles.length === 0 && placeholders.length === 0 ? (
+              <div className="empty">NO FILES MATCH YOUR SEARCH</div>
             ) : (
               <>
                 {placeholders.map((item) => (
                   <PlaceholderCard item={item} key={item.id} />
                 ))}
-                {files.map((file) => (
+                {visibleFiles.map((file) => (
                 <FileCard
                   api={api}
                   confirmDelete={confirmDelete === file.id}
@@ -1327,11 +1440,12 @@ export default function App() {
                   isDesktop={isDesktop}
                   key={file.id}
                   onCopyHash={() => copyText(file.sha256, "Hash copied")}
+                  onCopyLink={() => copyFileLink(file)}
                   onCopyText={() => copyFileText(file)}
                   onDelete={() => deleteFile(file)}
                   onDownload={() => downloadFile(file)}
                   onPreview={() => setPreviewFile(file)}
-                  onRename={() => renameFolder(file)}
+                  onRename={() => renameEntry(file)}
                   onRequestDelete={() => setConfirmDelete(file.id)}
                   onCancelDelete={() => setConfirmDelete(null)}
                   onStartDrag={(event) => startExternalDrag(file, event)}
@@ -1352,6 +1466,7 @@ export default function App() {
           onCopyImage={() => copyImage(previewFile)}
           onCopyText={() => copyFileText(previewFile)}
           onDownload={() => downloadFile(previewFile)}
+          onRename={() => renameEntry(previewFile)}
         />
       )}
 
@@ -1671,6 +1786,49 @@ function UpdateInline({ update, onDownload, onInstall }) {
   );
 }
 
+// Size label for a transfer row, extended with a live speed + ETA readout while
+// the transfer is running. Rate is smoothed from progress deltas (progress
+// updates already re-render this component, so no extra timer is needed).
+function TransferMeta({ item, activeStatus }) {
+  const track = useRef({ at: 0, bytes: 0, rate: 0 });
+  const active = item.status === activeStatus;
+  let label = "";
+
+  if (!active) {
+    track.current = { at: 0, bytes: 0, rate: 0 };
+  } else {
+    const now = Date.now();
+    const bytes = (Number(item.progress || 0) / 100) * Number(item.size || 0);
+    const prev = track.current;
+    if (!prev.at) {
+      track.current = { at: now, bytes, rate: 0 };
+    } else if (now - prev.at >= 750 && bytes >= prev.bytes) {
+      const instant = ((bytes - prev.bytes) / (now - prev.at)) * 1000;
+      const rate = prev.rate ? prev.rate * 0.7 + instant * 0.3 : instant;
+      track.current = { at: now, bytes, rate };
+    }
+    const rate = track.current.rate;
+    if (rate > 0 && item.size) {
+      const secondsLeft = Math.max(1, Math.ceil((item.size - bytes) / rate));
+      label = `${formatBytes(rate)}/s · ${formatEta(secondsLeft)} · `;
+    }
+  }
+
+  return (
+    <span className="mono small muted">
+      {label}
+      {formatBytes(item.size)}
+    </span>
+  );
+}
+
+function formatEta(seconds) {
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.ceil(minutes / 60)}h`;
+}
+
 function PlaceholderCard({ item }) {
   const name = item.name || "Incoming file";
   return (
@@ -1704,6 +1862,7 @@ function FileCard({
   isDesktop,
   onCancelDelete,
   onCopyHash,
+  onCopyLink,
   onCopyText,
   onDelete,
   onDownload,
@@ -1862,6 +2021,9 @@ function FileCard({
             )}
           </>
         )}
+        <button className="icon-btn" title="Copy link" onClick={onCopyLink}>
+          <Link2 size={16} />
+        </button>
         {confirmDelete ? (
           <span className="confirm">
             <button className="icon-btn danger" title="Delete now" onClick={onDelete}>
@@ -1881,7 +2043,7 @@ function FileCard({
   );
 }
 
-function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onCopyText, onDownload }) {
+function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onCopyText, onDownload, onRename }) {
   const kind = previewKindFor(file);
   const previewUrl = kind === "folder" ? "" : api.previewUrl(file.id);
   const [contextMenu, setContextMenu] = useState(null);
@@ -2008,6 +2170,9 @@ function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onCopyText, 
               <Copy size={14} /> Copy
             </button>
           )}
+          <button className="btn btn-ghost btn-sm" onClick={onRename}>
+            <Pencil size={14} /> Rename
+          </button>
           {kind !== "folder" && (
             <a className="btn btn-ghost btn-sm" href={previewUrl} target="_blank" rel="noreferrer">
               <ExternalLink size={14} /> Open
