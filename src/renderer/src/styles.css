@@ -763,7 +763,8 @@ body::before {
   background: var(--danger);
 }
 .upload-bar-fill[data-status="queued"],
-.upload-bar-fill[data-status="syncing"] {
+.upload-bar-fill[data-status="syncing"],
+.upload-bar-fill[data-status="preparing"] {
   background: var(--silver);
   opacity: 0.55;
 }

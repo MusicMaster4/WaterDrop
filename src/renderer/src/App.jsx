@@ -121,6 +121,10 @@ export default function App() {
   const drainingUploadsRef = useRef(false);
   const lastUploadPauseNoticeRef = useRef(0);
   const downloadAbortRef = useRef(new Map());
+  // IndexedDB must copy large Blobs before queueUpload resolves. Reserve each
+  // selection synchronously so a repeated drop during that copy cannot enqueue
+  // the same file again.
+  const preparingUploadKeysRef = useRef(new Set());
   // When the direct HTTPS origin is reachable, bulk transfers are routed through
   // it (HTTP/1.1 -> real parallel connections). Null means "use this page's
   // origin" (e.g. Tailscale Serve). Held in a ref so it can change mid-session
@@ -696,6 +700,47 @@ export default function App() {
   async function uploadFiles(picked, { groupSelection = createFolderUpload } = {}) {
     const valid = picked.filter(Boolean);
     if (!valid.length) return;
+    const accepted = [];
+    let duplicates = 0;
+
+    for (const file of valid) {
+      const preparationKey = filePreparationKey(file);
+      if (preparingUploadKeysRef.current.has(preparationKey)) {
+        duplicates += 1;
+        continue;
+      }
+      preparingUploadKeysRef.current.add(preparationKey);
+      accepted.push({
+        file,
+        preparationKey,
+        upload: {
+          id: crypto.randomUUID(),
+          name: file.name || "unnamed-file",
+          size: Number(file.size || 0),
+          progress: 1,
+          status: "preparing",
+          createdAt: Date.now(),
+          queued: false,
+        },
+      });
+    }
+
+    if (duplicates > 0) {
+      notify(
+        duplicates === 1
+          ? "This file is already being prepared."
+          : `${duplicates} files are already being prepared.`,
+        "info"
+      );
+    }
+    if (!accepted.length) return;
+
+    // Render before folder creation or the potentially slow IndexedDB Blob
+    // copy. The same row is reused for every later upload state.
+    setUploads((items) =>
+      accepted.reduce((next, item) => upsertUpload(next, item.upload), items)
+    );
+
     let targetFolder = null;
     if (groupSelection) {
       try {
@@ -703,20 +748,29 @@ export default function App() {
         targetFolder = result.folder;
         await refreshFiles({ silent: true });
       } catch (err) {
+        const abandonedIds = new Set(accepted.map((item) => item.upload.id));
+        accepted.forEach((item) => preparingUploadKeysRef.current.delete(item.preparationKey));
+        setUploads((items) => items.filter((item) => !abandonedIds.has(item.id)));
         notify(err.message || "Could not create folder", "warn");
         return;
       }
     }
     if (!api.rawUploadUrl || !isUploadQueueSupported()) {
-      valid.forEach((file) => uploadOneLegacy(file, targetFolder));
+      accepted.forEach((item) => {
+        uploadOneLegacy(item.file, targetFolder, item.upload);
+        preparingUploadKeysRef.current.delete(item.preparationKey);
+      });
       return;
     }
 
     let queued = 0;
     let browserBackground = 0;
-    for (const file of valid) {
+    for (const item of accepted) {
+      const { file, preparationKey, upload } = item;
       try {
         const record = await queueUpload(file, api.rawUploadUrl, {
+          id: upload.id,
+          createdAt: upload.createdAt,
           folderId: targetFolder?.id,
           folderName: targetFolder?.name,
         });
@@ -729,7 +783,9 @@ export default function App() {
         }
       } catch (err) {
         notify(err.message || `Could not queue ${file.name}`, "warn");
-        uploadOneLegacy(file, targetFolder);
+        uploadOneLegacy(file, targetFolder, upload);
+      } finally {
+        preparingUploadKeysRef.current.delete(preparationKey);
       }
     }
 
@@ -737,7 +793,7 @@ export default function App() {
       const hasBackgroundSync = await registerBackgroundUpload();
       notify(
         targetFolder
-          ? `${valid.length} files queued in ${targetFolder.name}.`
+          ? `${accepted.length} files queued in ${targetFolder.name}.`
           : browserBackground > 0
           ? "Upload handed to the browser background task."
           : hasBackgroundSync
@@ -799,12 +855,17 @@ export default function App() {
     }
   }
 
-  function uploadOneLegacy(file, targetFolder = null) {
-    const id = crypto.randomUUID();
-    setUploads((items) => [
-      ...items,
-      { id, name: file.name, size: file.size, progress: 1, status: "uploading", createdAt: Date.now() },
-    ]);
+  function uploadOneLegacy(file, targetFolder = null, pendingUpload = null) {
+    const id = pendingUpload?.id || crypto.randomUUID();
+    setUploads((items) => upsertUpload(items, {
+      id,
+      name: file.name,
+      size: file.size,
+      progress: 1,
+      status: "uploading",
+      createdAt: pendingUpload?.createdAt || Date.now(),
+      queued: false,
+    }));
 
     const xhr = new XMLHttpRequest();
     const useRawUpload = Boolean(api.rawUploadUrl);
@@ -2451,11 +2512,16 @@ function sortUploads(a, b) {
 }
 
 function uploadStatusText(upload) {
+  if (upload.status === "preparing") return "preparing";
   if (upload.status === "done") return "done";
   if (upload.status === "error") return "error";
   if (upload.status === "queued") return "queued";
   if (upload.status === "syncing") return "syncing";
   return `${upload.progress || 0}%`;
+}
+
+function filePreparationKey(file) {
+  return [file?.name || "", Number(file?.size || 0), Number(file?.lastModified || 0), file?.type || ""].join("\u0000");
 }
 
 function downloadStatusText(download) {

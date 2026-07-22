@@ -18,7 +18,7 @@ export async function queueUpload(file, uploadUrl, options = {}) {
   if (!isUploadQueueSupported()) throw new Error("Upload queue is not available");
   const now = Date.now();
   const record = {
-    id: crypto.randomUUID(),
+    id: options.id || crypto.randomUUID(),
     name: file.name || "unnamed-file",
     size: Number(file.size || 0),
     mimeType: file.type || "application/octet-stream",
@@ -27,7 +27,7 @@ export async function queueUpload(file, uploadUrl, options = {}) {
     status: "queued",
     progress: 1,
     attempts: 0,
-    createdAt: now,
+    createdAt: Number(options.createdAt || now),
     updatedAt: now,
     lockedUntil: 0,
     lastError: "",
