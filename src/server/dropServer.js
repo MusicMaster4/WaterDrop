@@ -186,6 +186,17 @@ class FileStore extends EventEmitter {
       .sort((a, b) => a.createdAt - b.createdAt);
   }
 
+  // Effective retention, honoring the user's retentionDays setting (1-30 days).
+  retentionMs() {
+    const days = Number(this.settings.retentionDays);
+    const clamped = Number.isFinite(days) ? Math.min(30, Math.max(1, Math.round(days))) : 7;
+    return clamped * 24 * 60 * 60 * 1000;
+  }
+
+  retentionDays() {
+    return Math.round(this.retentionMs() / (24 * 60 * 60 * 1000));
+  }
+
   async createFolder({ name } = {}) {
     const now = Date.now();
     const entry = {
@@ -194,7 +205,7 @@ class FileStore extends EventEmitter {
       name: safeDisplayName(name || this.nextFolderName()),
       size: 0,
       createdAt: now,
-      expiresAt: now + RETENTION_MS,
+      expiresAt: now + this.retentionMs(),
       downloads: 0,
       lastDownloadedAt: null,
     };
@@ -211,6 +222,15 @@ class FileStore extends EventEmitter {
     await this.saveFiles();
     this.notifyFilesChanged("folder-rename");
     return toPublicFile(folder, this);
+  }
+
+  async renameFile(id, name) {
+    const file = this.get(id);
+    if (!file || file.kind === "folder") return null;
+    file.name = safeDisplayName(name || file.name);
+    await this.saveFiles();
+    this.notifyFilesChanged("file-rename");
+    return toPublicFile(file, this);
   }
 
   nextFolderName() {
@@ -247,7 +267,7 @@ class FileStore extends EventEmitter {
       size,
       sha256,
       createdAt: now,
-      expiresAt: folder ? folder.expiresAt : now + RETENTION_MS,
+      expiresAt: folder ? folder.expiresAt : now + this.retentionMs(),
       downloads: 0,
       lastDownloadedAt: null,
     };
@@ -772,7 +792,7 @@ async function handleApi({ req, res, relative, store, getPort, getHttpsPort, eve
     sendJson(res, 200, {
       name: "WaterDrop",
       basePath: BASE_PATH,
-      retentionDays: 7,
+      retentionDays: store.retentionDays(),
       network,
       qrSvg,
     });
@@ -857,6 +877,12 @@ async function handleApi({ req, res, relative, store, getPort, getHttpsPort, eve
     const action = fileMatch[2];
     if ((req.method === "GET" || req.method === "HEAD") && action === "download") {
       await handleDownload(req, res, store, id);
+      return;
+    }
+    if (req.method === "PATCH" && !action) {
+      const body = await readRequestJson(req);
+      const file = await store.renameFile(id, body.name);
+      sendJson(res, file ? 200 : 404, file ? { file } : { error: "File not found" });
       return;
     }
     if ((req.method === "GET" || req.method === "HEAD") && action === "preview") {
@@ -1298,6 +1324,14 @@ async function sendStoredFile({ req, res, store, id, disposition, cacheControl, 
 
   if (range && range.invalid) {
     res.writeHead(416, { ...commonHeaders, "Content-Range": `bytes */${stat.size}` });
+    res.end();
+    return;
+  }
+
+  // The ETag is the file's content hash, so a matching If-None-Match means the
+  // client already holds these exact bytes — answer 304 and skip the transfer.
+  if (!range && cleanHeaderValue(req.headers["if-none-match"]) === commonHeaders.ETag) {
+    res.writeHead(304, commonHeaders);
     res.end();
     return;
   }

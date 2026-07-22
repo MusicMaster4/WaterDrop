@@ -16,11 +16,13 @@ import {
   Folder,
   HardDriveDownload,
   Info,
+  Link2,
   MonitorUp,
   MoreHorizontal,
   Pencil,
   QrCode,
   RefreshCw,
+  Search,
   Send,
   Server,
   Settings2,
@@ -83,6 +85,7 @@ const apiDefault = {
   cancelUpload: (id) => request(`api/uploads/${id}`, { method: "DELETE" }),
   createFolder: (name) => request("api/folders", { method: "POST", body: JSON.stringify({ name }) }),
   renameFolder: (id, name) => request(`api/folders/${id}`, { method: "PATCH", body: JSON.stringify({ name }) }),
+  renameFile: (id, name) => request(`api/files/${id}`, { method: "PATCH", body: JSON.stringify({ name }) }),
   clearFiles: () => request("api/files", { method: "DELETE" }),
   deleteFile: (id) => request(`api/files/${id}`, { method: "DELETE" }),
   configureServe: () => request("api/tailscale/serve", { method: "POST" }),
@@ -102,6 +105,7 @@ function buildApi(baseUrl = "") {
     cancelUpload: (id) => request(join(`api/uploads/${id}`), { method: "DELETE" }),
     createFolder: (name) => request(join("api/folders"), { method: "POST", body: JSON.stringify({ name }) }),
     renameFolder: (id, name) => request(join(`api/folders/${id}`), { method: "PATCH", body: JSON.stringify({ name }) }),
+    renameFile: (id, name) => request(join(`api/files/${id}`), { method: "PATCH", body: JSON.stringify({ name }) }),
     clearFiles: () => request(join("api/files"), { method: "DELETE" }),
     deleteFile: (id) => request(join(`api/files/${id}`), { method: "DELETE" }),
     configureServe: () => request(join("api/tailscale/serve"), { method: "POST" }),
@@ -116,6 +120,11 @@ export default function App() {
   const serviceWorkerRegistrationRef = useRef(null);
   const drainingUploadsRef = useRef(false);
   const lastUploadPauseNoticeRef = useRef(0);
+  const downloadAbortRef = useRef(new Map());
+  // IndexedDB must copy large Blobs before queueUpload resolves. Reserve each
+  // selection synchronously so a repeated drop during that copy cannot enqueue
+  // the same file again.
+  const preparingUploadKeysRef = useRef(new Set());
   // When the direct HTTPS origin is reachable, bulk transfers are routed through
   // it (HTTP/1.1 -> real parallel connections). Null means "use this page's
   // origin" (e.g. Tailscale Serve). Held in a ref so it can change mid-session
@@ -128,8 +137,11 @@ export default function App() {
   const [pending, setPending] = useState([]);
   const [settings, setSettings] = useState({});
   const [uploads, setUploads] = useState([]);
+  const [downloads, setDownloads] = useState([]);
   const [textDraft, setTextDraft] = useState("");
   const [textComposerOpen, setTextComposerOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [sortBy, setSortBy] = useState("recent");
   const [createFolderUpload, setCreateFolderUpload] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(true);
@@ -151,10 +163,11 @@ export default function App() {
     if (!message) return;
     if (noticeTimeoutRef.current) window.clearTimeout(noticeTimeoutRef.current);
     setNotice({ id: crypto.randomUUID(), message, kind, action });
+    // Warnings stay visible longer — they usually need the user to act.
     noticeTimeoutRef.current = window.setTimeout(() => {
       setNotice(null);
       noticeTimeoutRef.current = null;
-    }, 4800);
+    }, kind === "warn" ? 8000 : 4800);
   }, []);
 
   useEffect(() => () => {
@@ -543,6 +556,48 @@ export default function App() {
     [pending, files]
   );
 
+  // Shelf view: filter by the search box, then apply the chosen sort order.
+  const visibleFiles = useMemo(() => {
+    const term = query.trim().toLowerCase();
+    const matched = term
+      ? files.filter((file) => String(file.name || "").toLowerCase().includes(term))
+      : files;
+    if (sortBy === "name") {
+      return [...matched].sort((a, b) =>
+        String(a.name || "").localeCompare(String(b.name || ""), undefined, { sensitivity: "base" })
+      );
+    }
+    if (sortBy === "size") {
+      return [...matched].sort((a, b) => Number(b.size || 0) - Number(a.size || 0));
+    }
+    return matched; // "recent": the server already lists newest first
+  }, [files, query, sortBy]);
+
+  // Re-render once a minute so the "expires in" countdowns stay honest without
+  // any network traffic.
+  const [, setClockTick] = useState(0);
+  useEffect(() => {
+    const timer = window.setInterval(() => setClockTick((tick) => tick + 1), 60 * 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  // Paste-to-upload: Ctrl+V with files/images on the clipboard drops them on the
+  // shelf. Pastes aimed at inputs (search box, text composer) are left alone.
+  const uploadFilesRef = useRef(null);
+  uploadFilesRef.current = uploadFiles;
+  useEffect(() => {
+    const onPaste = (event) => {
+      const target = event.target;
+      if (target?.closest?.("input, textarea, [contenteditable]")) return;
+      const pasted = Array.from(event.clipboardData?.files || []);
+      if (!pasted.length) return;
+      event.preventDefault();
+      uploadFilesRef.current?.(pasted);
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, []);
+
   async function copyText(text, label = "Copied") {
     if (!text) return;
     try {
@@ -645,6 +700,47 @@ export default function App() {
   async function uploadFiles(picked, { groupSelection = createFolderUpload } = {}) {
     const valid = picked.filter(Boolean);
     if (!valid.length) return;
+    const accepted = [];
+    let duplicates = 0;
+
+    for (const file of valid) {
+      const preparationKey = filePreparationKey(file);
+      if (preparingUploadKeysRef.current.has(preparationKey)) {
+        duplicates += 1;
+        continue;
+      }
+      preparingUploadKeysRef.current.add(preparationKey);
+      accepted.push({
+        file,
+        preparationKey,
+        upload: {
+          id: crypto.randomUUID(),
+          name: file.name || "unnamed-file",
+          size: Number(file.size || 0),
+          progress: 1,
+          status: "preparing",
+          createdAt: Date.now(),
+          queued: false,
+        },
+      });
+    }
+
+    if (duplicates > 0) {
+      notify(
+        duplicates === 1
+          ? "This file is already being prepared."
+          : `${duplicates} files are already being prepared.`,
+        "info"
+      );
+    }
+    if (!accepted.length) return;
+
+    // Render before folder creation or the potentially slow IndexedDB Blob
+    // copy. The same row is reused for every later upload state.
+    setUploads((items) =>
+      accepted.reduce((next, item) => upsertUpload(next, item.upload), items)
+    );
+
     let targetFolder = null;
     if (groupSelection) {
       try {
@@ -652,20 +748,29 @@ export default function App() {
         targetFolder = result.folder;
         await refreshFiles({ silent: true });
       } catch (err) {
+        const abandonedIds = new Set(accepted.map((item) => item.upload.id));
+        accepted.forEach((item) => preparingUploadKeysRef.current.delete(item.preparationKey));
+        setUploads((items) => items.filter((item) => !abandonedIds.has(item.id)));
         notify(err.message || "Could not create folder", "warn");
         return;
       }
     }
     if (!api.rawUploadUrl || !isUploadQueueSupported()) {
-      valid.forEach((file) => uploadOneLegacy(file, targetFolder));
+      accepted.forEach((item) => {
+        uploadOneLegacy(item.file, targetFolder, item.upload);
+        preparingUploadKeysRef.current.delete(item.preparationKey);
+      });
       return;
     }
 
     let queued = 0;
     let browserBackground = 0;
-    for (const file of valid) {
+    for (const item of accepted) {
+      const { file, preparationKey, upload } = item;
       try {
         const record = await queueUpload(file, api.rawUploadUrl, {
+          id: upload.id,
+          createdAt: upload.createdAt,
           folderId: targetFolder?.id,
           folderName: targetFolder?.name,
         });
@@ -678,7 +783,9 @@ export default function App() {
         }
       } catch (err) {
         notify(err.message || `Could not queue ${file.name}`, "warn");
-        uploadOneLegacy(file, targetFolder);
+        uploadOneLegacy(file, targetFolder, upload);
+      } finally {
+        preparingUploadKeysRef.current.delete(preparationKey);
       }
     }
 
@@ -686,7 +793,7 @@ export default function App() {
       const hasBackgroundSync = await registerBackgroundUpload();
       notify(
         targetFolder
-          ? `${valid.length} files queued in ${targetFolder.name}.`
+          ? `${accepted.length} files queued in ${targetFolder.name}.`
           : browserBackground > 0
           ? "Upload handed to the browser background task."
           : hasBackgroundSync
@@ -748,12 +855,17 @@ export default function App() {
     }
   }
 
-  function uploadOneLegacy(file, targetFolder = null) {
-    const id = crypto.randomUUID();
-    setUploads((items) => [
-      ...items,
-      { id, name: file.name, size: file.size, progress: 1, status: "uploading", createdAt: Date.now() },
-    ]);
+  function uploadOneLegacy(file, targetFolder = null, pendingUpload = null) {
+    const id = pendingUpload?.id || crypto.randomUUID();
+    setUploads((items) => upsertUpload(items, {
+      id,
+      name: file.name,
+      size: file.size,
+      progress: 1,
+      status: "uploading",
+      createdAt: pendingUpload?.createdAt || Date.now(),
+      queued: false,
+    }));
 
     const xhr = new XMLHttpRequest();
     const useRawUpload = Boolean(api.rawUploadUrl);
@@ -826,29 +938,71 @@ export default function App() {
 
   // Accelerated multi-connection download with a plain native download as the
   // fallback for folders, small files, unsupported browsers, or any error.
+  // Progress is shown as a stable card with a bar (not re-toasted every tick).
   async function browserDownload(file) {
     if (shouldAccelerateDownload(file)) {
-      let lastPct = -100;
+      const downloadId = crypto.randomUUID();
+      const controller = new AbortController();
+      downloadAbortRef.current.set(downloadId, controller);
+      setDownloads((items) => [
+        ...items,
+        {
+          id: downloadId,
+          name: file.name || "download",
+          size: file.size || 0,
+          progress: 1,
+          status: "downloading",
+          createdAt: Date.now(),
+        },
+      ]);
       const base = transferBaseRef.current;
       const url = base ? new URL(`api/files/${file.id}/download`, base).toString() : api.downloadUrl(file.id);
       try {
-        notify(`Downloading ${file.name}…`, "info");
         await parallelDownload(file, url, {
+          signal: controller.signal,
           onProgress: (pct) => {
-            if (pct - lastPct >= 10) {
-              lastPct = pct;
-              notify(`Downloading ${file.name} — ${pct}%`, "info");
-            }
+            const progress = Math.max(1, Math.min(99, pct));
+            setDownloads((items) =>
+              items.map((item) => (item.id === downloadId ? { ...item, progress } : item))
+            );
           },
         });
+        setDownloads((items) =>
+          items.map((item) =>
+            item.id === downloadId ? { ...item, progress: 100, status: "done" } : item
+          )
+        );
+        window.setTimeout(() => {
+          setDownloads((items) => items.filter((item) => item.id !== downloadId));
+        }, 2200);
         notify("Download complete", "ok");
         window.setTimeout(() => refreshFiles({ silent: true }), 500);
         return;
-      } catch {
+      } catch (err) {
+        setDownloads((items) => items.filter((item) => item.id !== downloadId));
+        if (err?.name === "AbortError") {
+          notify("Download cancelled", "info");
+          return;
+        }
+        notify("Download error — retrying with browser", "warn");
         // Fall through to the native download below.
+      } finally {
+        downloadAbortRef.current.delete(downloadId);
       }
     }
     nativeDownload(file);
+  }
+
+  function cancelDownload(download) {
+    if (!download?.id) return;
+    downloadAbortRef.current.get(download.id)?.abort();
+  }
+
+  function dismissDownload(download) {
+    if (!download?.id) return;
+    downloadAbortRef.current.get(download.id)?.abort();
+    downloadAbortRef.current.delete(download.id);
+    setDownloads((items) => items.filter((item) => item.id !== download.id));
   }
 
   function nativeDownload(file) {
@@ -862,20 +1016,31 @@ export default function App() {
     window.setTimeout(() => refreshFiles({ silent: true }), 1000);
   }
 
-  async function renameFolder(file) {
-    if (!isFolderEntry(file)) return;
-    const nextName = window.prompt("Folder name", file.name);
+  async function renameEntry(file) {
+    const isFolder = isFolderEntry(file);
+    const nextName = window.prompt(isFolder ? "Folder name" : "File name", file.name);
     if (nextName === null) return;
     const trimmed = nextName.trim();
     if (!trimmed || trimmed === file.name) return;
     try {
-      const result = await api.renameFolder(file.id, trimmed);
-      setFiles((items) => items.map((item) => (item.id === file.id ? result.folder : item)));
-      if (previewFile?.id === file.id) setPreviewFile(result.folder);
-      notify("Folder renamed", "ok");
+      const result = isFolder
+        ? await api.renameFolder(file.id, trimmed)
+        : await api.renameFile(file.id, trimmed);
+      const renamed = result.folder || result.file;
+      setFiles((items) => items.map((item) => (item.id === file.id ? renamed : item)));
+      if (previewFile?.id === file.id) setPreviewFile(renamed);
+      notify(isFolder ? "Folder renamed" : "File renamed", "ok");
     } catch (err) {
       notify(err.message || "Rename failed", "warn");
     }
+  }
+
+  // Absolute download link built on the phone-reachable URL, so a copied link
+  // works on any device in the tailnet, not just this one.
+  function copyFileLink(file) {
+    const base = preferredUrl || window.location.href;
+    const root = base.endsWith("/") ? base : `${base}/`;
+    copyText(new URL(`api/files/${file.id}/download`, root).toString(), "Link copied");
   }
 
   function startExternalDrag(file, event) {
@@ -1036,6 +1201,23 @@ export default function App() {
                   onChange={(event) => updateSetting({ minimizeToTray: event.target.checked })}
                 />
               </label>
+              <label className="toggle-row">
+                <span>
+                  <span className="toggle-title">Keep files for</span>
+                  <span className="toggle-sub mono small muted">Shelf auto-expiry.</span>
+                </span>
+                <select
+                  className="settings-select mono small"
+                  value={Number(settings.retentionDays) || 7}
+                  onChange={(event) => updateSetting({ retentionDays: Number(event.target.value) })}
+                >
+                  <option value={1}>1 day</option>
+                  <option value={3}>3 days</option>
+                  <option value={7}>7 days</option>
+                  <option value={14}>14 days</option>
+                  <option value={30}>30 days</option>
+                </select>
+              </label>
               <div className="update-row">
                 <span className="mono small muted">
                   v{formatAppVersion(update?.currentVersion || appInfo?.version || "?")}
@@ -1071,7 +1253,7 @@ export default function App() {
               <span className="sep" />
               <span>{formatBytes(stats.totalBytes)}</span>
               <span className="sep" />
-              <span>{Number.isFinite(stats.nextExpiry) ? `next ${timeLeft(stats.nextExpiry)}` : "7 day shelf"}</span>
+              <span>{Number.isFinite(stats.nextExpiry) ? `next ${timeLeft(stats.nextExpiry)}` : `${Number(settings.retentionDays) || 7} day shelf`}</span>
             </div>
             <div className="work-head-actions">
               <button className="icon-btn" title="Refresh files" onClick={refreshFiles}>
@@ -1100,7 +1282,11 @@ export default function App() {
           </div>
 
           {notice && (
-            <div className={`status-line ${notice.kind === "warn" ? "is-warn" : notice.kind === "ok" ? "is-ok" : ""}`}>
+            <div
+              className={`status-line ${notice.kind === "warn" ? "is-warn" : notice.kind === "ok" ? "is-ok" : ""}`}
+              role="status"
+              aria-live="polite"
+            >
               <span className={`dot ${notice.kind === "ok" ? "dot-ok" : notice.kind === "warn" ? "dot-warn" : "dot-idle"}`} />
               <span>{notice.message}</span>
               {notice.action && (
@@ -1202,8 +1388,38 @@ export default function App() {
 
           <input ref={fileInputRef} type="file" multiple hidden onChange={onFilesPicked} />
 
-          {uploads.length > 0 && (
+          {(downloads.length > 0 || uploads.length > 0) && (
             <div className="uploads">
+              {downloads.map((download) => (
+                <div className="upload-row" key={download.id}>
+                  <div className="upload-top">
+                    <span className="upload-name" title={download.name}>{download.name}</span>
+                    <span className={`upload-status mono small ${download.status === "done" ? "ok" : ""}`}>
+                      {downloadStatusText(download)}
+                    </span>
+                    {download.status === "done" && (
+                      <button className="icon-btn upload-dismiss" title="Dismiss" onClick={() => dismissDownload(download)}>
+                        <X size={14} />
+                      </button>
+                    )}
+                  </div>
+                  <div className="upload-tail">
+                    <div className="upload-bar">
+                      <div
+                        className="upload-bar-fill"
+                        data-status={download.status === "done" ? "done" : "downloading"}
+                        style={{ width: `${download.progress || 0}%` }}
+                      />
+                    </div>
+                    {download.status === "downloading" && (
+                      <button className="btn btn-ghost btn-xs upload-cancel" onClick={() => cancelDownload(download)}>
+                        <X size={13} /> Cancel
+                      </button>
+                    )}
+                    <TransferMeta item={download} activeStatus="downloading" />
+                  </div>
+                </div>
+              ))}
               {uploads.map((upload) => (
                 <div className="upload-row" key={upload.id}>
                   <div className="upload-top">
@@ -1230,22 +1446,54 @@ export default function App() {
                         <X size={13} /> Cancel
                       </button>
                     )}
-                    <span className="mono small muted">{formatBytes(upload.size)}</span>
+                    <TransferMeta item={upload} activeStatus="uploading" />
                   </div>
                 </div>
               ))}
             </div>
           )}
 
+          {files.length > 0 && (
+            <div className="shelf-tools">
+              <label className="shelf-search">
+                <Search size={14} aria-hidden="true" />
+                <input
+                  type="search"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder="Search files..."
+                  aria-label="Search files"
+                />
+                {query && (
+                  <button className="shelf-search-clear" type="button" title="Clear search" onClick={() => setQuery("")}>
+                    <X size={14} />
+                  </button>
+                )}
+              </label>
+              <select
+                className="settings-select mono small"
+                value={sortBy}
+                onChange={(event) => setSortBy(event.target.value)}
+                aria-label="Sort files"
+              >
+                <option value="recent">Newest</option>
+                <option value="name">Name</option>
+                <option value="size">Size</option>
+              </select>
+            </div>
+          )}
+
           <section className="shelf">
             {files.length === 0 && placeholders.length === 0 ? (
               <div className="empty">NO FILES ON THE SHELF</div>
+            ) : visibleFiles.length === 0 && placeholders.length === 0 ? (
+              <div className="empty">NO FILES MATCH YOUR SEARCH</div>
             ) : (
               <>
                 {placeholders.map((item) => (
                   <PlaceholderCard item={item} key={item.id} />
                 ))}
-                {files.map((file) => (
+                {visibleFiles.map((file) => (
                 <FileCard
                   api={api}
                   confirmDelete={confirmDelete === file.id}
@@ -1253,11 +1501,12 @@ export default function App() {
                   isDesktop={isDesktop}
                   key={file.id}
                   onCopyHash={() => copyText(file.sha256, "Hash copied")}
+                  onCopyLink={() => copyFileLink(file)}
                   onCopyText={() => copyFileText(file)}
                   onDelete={() => deleteFile(file)}
                   onDownload={() => downloadFile(file)}
                   onPreview={() => setPreviewFile(file)}
-                  onRename={() => renameFolder(file)}
+                  onRename={() => renameEntry(file)}
                   onRequestDelete={() => setConfirmDelete(file.id)}
                   onCancelDelete={() => setConfirmDelete(null)}
                   onStartDrag={(event) => startExternalDrag(file, event)}
@@ -1278,6 +1527,7 @@ export default function App() {
           onCopyImage={() => copyImage(previewFile)}
           onCopyText={() => copyFileText(previewFile)}
           onDownload={() => downloadFile(previewFile)}
+          onRename={() => renameEntry(previewFile)}
         />
       )}
 
@@ -1597,6 +1847,49 @@ function UpdateInline({ update, onDownload, onInstall }) {
   );
 }
 
+// Size label for a transfer row, extended with a live speed + ETA readout while
+// the transfer is running. Rate is smoothed from progress deltas (progress
+// updates already re-render this component, so no extra timer is needed).
+function TransferMeta({ item, activeStatus }) {
+  const track = useRef({ at: 0, bytes: 0, rate: 0 });
+  const active = item.status === activeStatus;
+  let label = "";
+
+  if (!active) {
+    track.current = { at: 0, bytes: 0, rate: 0 };
+  } else {
+    const now = Date.now();
+    const bytes = (Number(item.progress || 0) / 100) * Number(item.size || 0);
+    const prev = track.current;
+    if (!prev.at) {
+      track.current = { at: now, bytes, rate: 0 };
+    } else if (now - prev.at >= 750 && bytes >= prev.bytes) {
+      const instant = ((bytes - prev.bytes) / (now - prev.at)) * 1000;
+      const rate = prev.rate ? prev.rate * 0.7 + instant * 0.3 : instant;
+      track.current = { at: now, bytes, rate };
+    }
+    const rate = track.current.rate;
+    if (rate > 0 && item.size) {
+      const secondsLeft = Math.max(1, Math.ceil((item.size - bytes) / rate));
+      label = `${formatBytes(rate)}/s · ${formatEta(secondsLeft)} · `;
+    }
+  }
+
+  return (
+    <span className="mono small muted">
+      {label}
+      {formatBytes(item.size)}
+    </span>
+  );
+}
+
+function formatEta(seconds) {
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.ceil(minutes / 60)}h`;
+}
+
 function PlaceholderCard({ item }) {
   const name = item.name || "Incoming file";
   return (
@@ -1630,6 +1923,7 @@ function FileCard({
   isDesktop,
   onCancelDelete,
   onCopyHash,
+  onCopyLink,
   onCopyText,
   onDelete,
   onDownload,
@@ -1788,6 +2082,9 @@ function FileCard({
             )}
           </>
         )}
+        <button className="icon-btn" title="Copy link" onClick={onCopyLink}>
+          <Link2 size={16} />
+        </button>
         {confirmDelete ? (
           <span className="confirm">
             <button className="icon-btn danger" title="Delete now" onClick={onDelete}>
@@ -1807,7 +2104,7 @@ function FileCard({
   );
 }
 
-function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onCopyText, onDownload }) {
+function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onCopyText, onDownload, onRename }) {
   const kind = previewKindFor(file);
   const previewUrl = kind === "folder" ? "" : api.previewUrl(file.id);
   const [contextMenu, setContextMenu] = useState(null);
@@ -1934,6 +2231,9 @@ function PreviewModal({ api, file, isDesktop, onClose, onCopyImage, onCopyText, 
               <Copy size={14} /> Copy
             </button>
           )}
+          <button className="btn btn-ghost btn-sm" onClick={onRename}>
+            <Pencil size={14} /> Rename
+          </button>
           {kind !== "folder" && (
             <a className="btn btn-ghost btn-sm" href={previewUrl} target="_blank" rel="noreferrer">
               <ExternalLink size={14} /> Open
@@ -2212,11 +2512,21 @@ function sortUploads(a, b) {
 }
 
 function uploadStatusText(upload) {
+  if (upload.status === "preparing") return "preparing";
   if (upload.status === "done") return "done";
   if (upload.status === "error") return "error";
   if (upload.status === "queued") return "queued";
   if (upload.status === "syncing") return "syncing";
   return `${upload.progress || 0}%`;
+}
+
+function filePreparationKey(file) {
+  return [file?.name || "", Number(file?.size || 0), Number(file?.lastModified || 0), file?.type || ""].join("\u0000");
+}
+
+function downloadStatusText(download) {
+  if (download.status === "done") return "done";
+  return `${download.progress || 0}%`;
 }
 
 function canDismissUpload(upload) {

@@ -763,9 +763,13 @@ body::before {
   background: var(--danger);
 }
 .upload-bar-fill[data-status="queued"],
-.upload-bar-fill[data-status="syncing"] {
+.upload-bar-fill[data-status="syncing"],
+.upload-bar-fill[data-status="preparing"] {
   background: var(--silver);
   opacity: 0.55;
+}
+.upload-bar-fill[data-status="downloading"] {
+  background: var(--ink);
 }
 .upload-cancel {
   flex: none;
@@ -1767,4 +1771,82 @@ body::before {
   .onb-phone-steps {
     grid-template-columns: repeat(3, 1fr);
   }
+}
+
+/* ============================================================
+   SHELF TOOLS -- search + sort
+   ============================================================ */
+.shelf-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.shelf-search {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 0 10px;
+  color: var(--muted);
+  transition: border-color 0.15s ease;
+}
+.shelf-search:focus-within {
+  border-color: var(--line-strong);
+}
+.shelf-search svg {
+  flex: none;
+}
+.shelf-search input {
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font: 0.8rem var(--mono);
+  padding: 9px 0;
+}
+.shelf-search input::placeholder {
+  color: var(--faint);
+}
+.shelf-search input::-webkit-search-cancel-button {
+  display: none;
+}
+.shelf-search-clear {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  background: none;
+  border: none;
+  padding: 4px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.shelf-search-clear:hover {
+  color: var(--ink);
+}
+
+.settings-select {
+  flex: none;
+  appearance: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--silver);
+  font-size: 0.72rem;
+  padding: 9px 10px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+.settings-select:hover {
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+.settings-select option {
+  background: #101014;
+  color: var(--text);
 }
