@@ -69,6 +69,7 @@ test("uploads, lists, previews, downloads, deletes, and clears files", async () 
 
     const strippedStatic = await fetch(`http://127.0.0.1:${server.port}/`);
     assert.equal(strippedStatic.status, 200);
+    assert.match(await strippedStatic.text(), /<title>WaterDrop<\/title>/);
 
     const id = listedBody.files[0].id;
     const head = await fetch(new URL(`api/files/${id}/download`, base), { method: "HEAD" });

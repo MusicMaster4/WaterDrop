@@ -1580,26 +1580,35 @@ async function serveStatic({ req, res, pathname, rendererDir }) {
     filePath = path.join(rendererDir, "index.html");
   }
 
-  let stat;
+  const noStoreAsset = /(?:^|[\\/])(?:index\.html|waterdrop-sw\.js|manifest\.webmanifest)$/.test(filePath);
+  let body = null;
+  let size;
   try {
-    stat = await fsp.stat(filePath);
+    if (req.method === "HEAD") {
+      size = (await fsp.stat(filePath)).size;
+    } else {
+      // Renderer assets are deliberately read before headers are committed.
+      // Streaming files directly out of an ASAR can fail after writeHead(),
+      // which aborts the socket and is surfaced by Tailscale Serve as HTTP 502.
+      body = await fsp.readFile(filePath);
+      size = body.length;
+    }
   } catch {
     sendJson(res, 503, { error: "Renderer has not been built yet. Run npm run build." });
     return;
   }
 
-  const noStoreAsset = /(?:^|[\\/])(?:index\.html|waterdrop-sw\.js|manifest\.webmanifest)$/.test(filePath);
   res.writeHead(200, {
     ...corsHeaders(),
     "Cache-Control": noStoreAsset ? "no-store" : "public, max-age=31536000, immutable",
-    "Content-Length": stat.size,
+    "Content-Length": size,
     "Content-Type": mime.lookup(filePath) || "application/octet-stream",
   });
   if (req.method === "HEAD") {
     res.end();
     return;
   }
-  pipeFileToResponse(res, filePath, { highWaterMark: DOWNLOAD_HIGH_WATER_MARK });
+  res.end(body);
 }
 
 function handleEvents(req, res, store, eventClients) {

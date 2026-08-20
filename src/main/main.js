@@ -119,7 +119,7 @@ async function autoPublishServe() {
     const state = await tailscale.status();
     if (!state.running || !state.loggedIn) return;
     const current = await tailscale.inspect(dropServer.port);
-    if (current.servePathConfigured) return; // already published to this port
+    if (current.servePathConfigured) return; // current port and /drop/ both verified
     const result = await tailscale.configureServe(dropServer.port);
     if (!result.ok) logDiagnostic("auto serve publish failed", result.message);
   } catch (err) {
