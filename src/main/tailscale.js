@@ -2,6 +2,7 @@
 
 const { execFile } = require("child_process");
 const fs = require("fs");
+const http = require("http");
 
 const CANDIDATES = {
   win32: [
@@ -112,10 +113,55 @@ function findServeHandler(config, pathName = "/drop") {
   return null;
 }
 
+function proxyTargetsPort(proxy, port) {
+  try {
+    const target = new URL(String(proxy || ""));
+    const host = target.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    return (
+      target.protocol === "http:" &&
+      ["127.0.0.1", "localhost", "::1"].includes(host) &&
+      Number(target.port) === Number(port) &&
+      (target.pathname === "/" || target.pathname === "")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function probeLocalOrigin(port, timeout = 2500) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (reachable, message = "") => {
+      if (settled) return;
+      settled = true;
+      resolve({ reachable, message });
+    };
+    const req = http.get(
+      { host: "127.0.0.1", port, path: "/drop/", timeout },
+      (res) => {
+        let bytes = 0;
+        res.on("data", (chunk) => { bytes += chunk.length; });
+        res.on("end", () => {
+          const reachable = res.statusCode === 200 && bytes > 0;
+          finish(reachable, reachable ? "" : `Local /drop/ returned HTTP ${res.statusCode} with ${bytes} bytes`);
+        });
+        res.on("error", (err) => finish(false, err.message));
+      }
+    );
+    req.on("timeout", () => req.destroy(new Error("Local /drop/ probe timed out")));
+    req.on("error", (err) => finish(false, err.message));
+  });
+}
+
 async function inspect(port, { httpsPort } = {}) {
   const ts = await status();
   const serve = await serveStatus();
   const handler = serve.ok ? findServeHandler(serve.config, "/drop") : null;
+  const serveProxyMatches = Boolean(handler && proxyTargetsPort(handler.proxy, port));
+  const origin = serveProxyMatches
+    ? await probeLocalOrigin(port)
+    : { reachable: false, message: handler ? "Tailscale Serve points to a different WaterDrop port" : "" };
+  const servePathConfigured = serveProxyMatches && origin.reachable;
   const serveUrl = ts.dnsName ? `https://${ts.dnsName}/drop/` : null;
   const directUrl = ts.tailnetIp ? `http://${ts.tailnetIp}:${port}/drop/` : null;
   const localUrl = `http://127.0.0.1:${port}/drop/`;
@@ -126,8 +172,11 @@ async function inspect(port, { httpsPort } = {}) {
   return {
     ...ts,
     serveOk: serve.ok,
-    serveMessage: serve.message,
-    servePathConfigured: Boolean(handler),
+    serveMessage: serve.message || origin.message,
+    servePathPresent: Boolean(handler),
+    serveProxyMatches,
+    serveOriginReachable: origin.reachable,
+    servePathConfigured,
     serveProxy: handler ? handler.proxy : null,
     serveUrl,
     directUrl,
@@ -136,7 +185,7 @@ async function inspect(port, { httpsPort } = {}) {
     // the direct port may be blocked by the Windows firewall. Serve always works.
     httpsDirectUrl,
     localUrl,
-    preferredUrl: handler && serveUrl ? serveUrl : directUrl || localUrl,
+    preferredUrl: servePathConfigured && serveUrl ? serveUrl : directUrl || localUrl,
     serveCommand: `tailscale serve --bg --yes --set-path /drop http://127.0.0.1:${port}`,
   };
 }
@@ -159,16 +208,26 @@ async function configureServe(port) {
   if (!result.ok) {
     return { ok: false, message: result.message || "tailscale serve failed" };
   }
-  return { ok: true, message: result.stdout.trim(), info: await inspect(port) };
+  const info = await inspect(port);
+  if (!info.servePathConfigured) {
+    return {
+      ok: false,
+      message: info.serveMessage || "Tailscale Serve was configured, but /drop/ is not reachable",
+      info,
+    };
+  }
+  return { ok: true, message: result.stdout.trim(), info };
 }
 
 module.exports = {
   configureServe,
   exePath,
+  findServeHandler,
   inspect,
+  probeLocalOrigin,
   provisionCert,
+  proxyTargetsPort,
   run,
   serveStatus,
   status,
 };
-
