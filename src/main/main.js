@@ -5,6 +5,7 @@ const path = require("path");
 const fs = require("fs");
 const { createDropServer } = require("../server/dropServer");
 const tailscale = require("./tailscale");
+const { createServeSupervisor } = require("./serveSupervisor");
 const { initUpdater } = require("./updater");
 
 let mainWindow = null;
@@ -13,6 +14,11 @@ let tray = null;
 let isQuitting = false;
 let dragIconImage = null;
 let appIconImage = null;
+const serveSupervisor = createServeSupervisor({
+  tailscale,
+  getPort: () => dropServer?.port,
+  onError: (context, err) => logDiagnostic(context, err),
+});
 
 // Write startup problems somewhere we can read them from an installed build,
 // where there is no console. Failing to log must never itself crash the app.
@@ -107,24 +113,6 @@ async function startServer() {
     rendererDir: rendererDir(),
   });
   return dropServer;
-}
-
-// Publish `/drop` over Tailscale Serve so the QR code carries the real
-// phone-reachable HTTPS link (https://<name>.ts.net/drop/) instead of a raw
-// loopback/IP:port URL that a phone can't open. Best-effort and non-blocking:
-// if Tailscale is missing or serve isn't available, the app still works locally.
-async function autoPublishServe() {
-  try {
-    if (!dropServer) return;
-    const state = await tailscale.status();
-    if (!state.running || !state.loggedIn) return;
-    const current = await tailscale.inspect(dropServer.port);
-    if (current.servePathConfigured) return; // current port and /drop/ both verified
-    const result = await tailscale.configureServe(dropServer.port);
-    if (!result.ok) logDiagnostic("auto serve publish failed", result.message);
-  } catch (err) {
-    logDiagnostic("auto serve publish error", err);
-  }
 }
 
 let httpsRenewTimer = null;
@@ -349,7 +337,7 @@ function wireIpc() {
     }
   });
 
-  ipcMain.handle("waterdrop:configure-serve", async () => tailscale.configureServe(dropServer.port));
+  ipcMain.handle("waterdrop:configure-serve", async () => serveSupervisor.ensureAvailable());
 
   // Fresh Tailscale status for the onboarding "re-check" buttons. Unlike
   // app-info (a startup snapshot), this re-runs the CLI on demand so the guide
@@ -371,7 +359,9 @@ if (gotLock) {
       }
       Menu.setApplicationMenu(null);
       await startServer();
-      autoPublishServe(); // best-effort, non-blocking: makes the QR a real phone link
+      // Keep the phone link published for the whole lifetime of the app. This
+      // also restores it after Tailscale restarts, updates, or reconnects.
+      serveSupervisor.start();
       autoEnableDirectHttps(); // best-effort: direct HTTPS unlocks full-speed parallel transfers
       scheduleHttpsRenewal();
       applyLoginSettings();
@@ -411,6 +401,7 @@ app.on("window-all-closed", () => {
 
 app.on("before-quit", async (event) => {
   isQuitting = true;
+  serveSupervisor.stop();
   if (!dropServer) return;
   event.preventDefault();
   const server = dropServer;

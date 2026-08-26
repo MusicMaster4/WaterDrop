@@ -481,19 +481,29 @@ export default function App() {
     };
   }, [api, busy, drainQueuedUploads, refreshFiles, refreshInfo, refreshQueuedUploads, registerBackgroundUpload]);
 
-  // Tailscale Serve publishes a few seconds after launch. Poll the network only
-  // until the QR carries the real phone link (serve path published), then stop —
-  // no perpetual background spawning of the Tailscale CLI.
+  // The main process supervises Tailscale Serve for the lifetime of WaterDrop.
+  // Poll the UI until the QR carries the real phone link; if a later refresh
+  // observes that it was lost, resume polling while the main process repairs it.
   const servePublished = Boolean(info?.network?.servePathConfigured);
   useEffect(() => {
     if (busy || servePublished) return undefined;
+    let cancelled = false;
     let attempts = 0;
-    const timer = window.setInterval(() => {
+    let timer = null;
+    const poll = async () => {
       attempts += 1;
-      refreshInfo({ silent: true });
-      if (attempts >= 12) window.clearInterval(timer); // give up after ~1 min
-    }, 5000);
-    return () => window.clearInterval(timer);
+      await refreshInfo({ silent: true });
+      if (!cancelled) {
+        // Fast feedback during startup, then a low-cost ongoing refresh so the
+        // status cannot stay stale after a long Tailscale outage.
+        timer = window.setTimeout(poll, attempts < 12 ? 5000 : 30000);
+      }
+    };
+    timer = window.setTimeout(poll, 5000);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, [busy, servePublished, refreshInfo]);
 
   useEffect(() => {
